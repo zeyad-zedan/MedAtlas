@@ -40,11 +40,12 @@ import {
   hashEmailForTombstone,
 } from '../middleware/auth.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
+import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
 
 export const OWNER_ADMIN_EMAIL = 'zeyadzedan098@gmail.com';
 export const EXAM_SUBMISSION_GRACE_SECONDS = 15;
 export const GENERIC_PASSWORD_RECOVERY_MESSAGE =
-  'If an account exists for that email address, password recovery instructions have been initiated.';
+  'If an account exists for that email address, a password reset email has been dispatched via Firebase Authentication.';
 
 /**
  * Error class representing messages that are safe to return to the client
@@ -341,13 +342,95 @@ export async function findUserByEmail(email: string) {
 }
 
 /**
- * Initiates a password recovery flow using a single-use, short-lived cryptographic token.
- * Stores only the SHA-256 hash of the token in the database, invalidates prior unconsumed tokens
- * for the account, and returns a uniform enumeration-safe message.
+ * Dispatches a password-reset email using the configured Firebase Authentication project
+ * (Identity Toolkit accounts:sendOobCode API) so no external custom webhook is required.
+ */
+export async function dispatchFirebasePasswordResetEmail(email: string): Promise<boolean> {
+  const apiKey = firebaseConfig?.apiKey?.trim();
+  if (!apiKey) return false;
+
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          requestType: 'PASSWORD_RESET',
+          email: email.toLowerCase().trim(),
+        }),
+      }
+    );
+    return res.ok;
+  } catch (err) {
+    console.error('Firebase Auth sendOobCode request failed:', err);
+    return false;
+  }
+}
+
+/**
+ * Verifies and consumes a Firebase Authentication password-reset oobCode via Identity Toolkit
+ * and returns the verified account email address.
+ */
+async function verifyAndConsumeFirebaseOobCode(
+  oobCode: string,
+  newPassword: string
+): Promise<string> {
+  const apiKey = firebaseConfig?.apiKey?.trim();
+  if (!apiKey) {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          oobCode,
+          newPassword,
+        }),
+      }
+    );
+  } catch {
+    throw new ClientSafeError(
+      'Failed to verify password recovery code with authentication provider.',
+      400
+    );
+  }
+
+  if (!res.ok) {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  const data = (await res.json()) as { email?: string; requestType?: string };
+  if (!data?.email || typeof data.email !== 'string') {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  return data.email.toLowerCase().trim();
+}
+
+/**
+ * Initiates a password recovery flow using Firebase Authentication's supported password-reset
+ * email delivery AND a single-use, short-lived (15-minute) SHA-256 hashed cryptographic token
+ * stored in PostgreSQL (`password_reset_tokens`).
+ * Invalidates prior unconsumed tokens for the account and returns an enumeration-safe response.
  */
 export async function requestPasswordRecoveryToken(
   email: string,
-  options?: { returnTokenForTesting?: boolean }
+  options?: { returnTokenForTesting?: boolean; triggerFirebaseEmail?: boolean }
 ): Promise<{
   accepted: true;
   message: string;
@@ -360,8 +443,14 @@ export async function requestPasswordRecoveryToken(
       throw new ClientSafeError('Please provide a valid email address.', 400);
     }
 
+    const shouldTriggerFirebase =
+      options?.triggerFirebaseEmail ?? process.env.NODE_ENV !== 'test';
+
     const user = await findUserByEmail(normalizedEmail);
     if (!user) {
+      if (shouldTriggerFirebase) {
+        await dispatchFirebasePasswordResetEmail(normalizedEmail);
+      }
       return {
         accepted: true,
         message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
@@ -391,23 +480,8 @@ export async function requestPasswordRecoveryToken(
       });
     });
 
-    // Optional external email webhook delivery when configured in deployment environment
-    const webhookUrl = process.env.PASSWORD_RESET_WEBHOOK_URL?.trim();
-    if (webhookUrl) {
-      try {
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            to: user.email,
-            displayName: user.displayName,
-            expiresAt: expiresAt.toISOString(),
-            resetToken: rawToken,
-          }),
-        });
-      } catch (deliveryErr) {
-        console.error('Password recovery webhook delivery failed:', deliveryErr);
-      }
+    if (shouldTriggerFirebase) {
+      await dispatchFirebasePasswordResetEmail(user.email);
     }
 
     const response: {
@@ -434,7 +508,7 @@ export async function requestPasswordRecoveryToken(
 }
 
 /**
- * Verifies and atomically consumes a single-use password recovery token,
+ * Verifies and atomically consumes a single-use password recovery token (or verified Firebase Auth oobCode),
  * updates the user's password hash, and increments tokenVersion to revoke prior sessions.
  */
 export async function confirmPasswordRecoveryToken(
@@ -443,7 +517,7 @@ export async function confirmPasswordRecoveryToken(
 ) {
   try {
     const cleanedToken = String(rawToken || '').trim();
-    if (!cleanedToken || cleanedToken.length < 32) {
+    if (!cleanedToken || cleanedToken.length < 20) {
       throw new ClientSafeError(
         'Invalid or expired password recovery token.',
         400
@@ -460,63 +534,117 @@ export async function confirmPasswordRecoveryToken(
     const now = new Date();
     const newPasswordHash = hashPassword(newPassword);
 
-    const updatedUser = await db.transaction(async (tx) => {
-      const tokenRows = await tx
-        .select()
-        .from(passwordResetTokens)
-        .where(eq(passwordResetTokens.tokenHash, tokenHash));
+    // Check if the token matches a SHA-256 hashed single-use token in PostgreSQL
+    const existingTokenRows = await db
+      .select()
+      .from(passwordResetTokens)
+      .where(eq(passwordResetTokens.tokenHash, tokenHash));
 
-      const tokenRecord = tokenRows[0];
-      if (
-        !tokenRecord ||
-        tokenRecord.consumedAt !== null ||
-        new Date(tokenRecord.expiresAt).getTime() <= now.getTime()
-      ) {
-        throw new ClientSafeError(
-          'Invalid, expired, or already used password recovery token.',
-          400
-        );
-      }
+    if (existingTokenRows.length > 0 || /^[a-f0-9]{64}$/i.test(cleanedToken)) {
+      const updatedUser = await db.transaction(async (tx) => {
+        const tokenRows = await tx
+          .select()
+          .from(passwordResetTokens)
+          .where(eq(passwordResetTokens.tokenHash, tokenHash));
 
-      // Atomic conditional consumption so concurrent requests with the same token cannot both succeed
-      const consumedRows = await tx
-        .update(passwordResetTokens)
-        .set({ consumedAt: now })
-        .where(
-          and(
-            eq(passwordResetTokens.id, tokenRecord.id),
-            isNull(passwordResetTokens.consumedAt)
+        const tokenRecord = tokenRows[0];
+        if (
+          !tokenRecord ||
+          tokenRecord.consumedAt !== null ||
+          new Date(tokenRecord.expiresAt).getTime() <= now.getTime()
+        ) {
+          throw new ClientSafeError(
+            'Invalid, expired, or already used password recovery token.',
+            400
+          );
+        }
+
+        // Atomic conditional consumption so concurrent requests with the same token cannot both succeed
+        const consumedRows = await tx
+          .update(passwordResetTokens)
+          .set({ consumedAt: now })
+          .where(
+            and(
+              eq(passwordResetTokens.id, tokenRecord.id),
+              isNull(passwordResetTokens.consumedAt)
+            )
           )
-        )
-        .returning();
+          .returning();
 
-      if (consumedRows.length === 0) {
-        throw new ClientSafeError(
-          'Invalid, expired, or already used password recovery token.',
-          400
-        );
-      }
+        if (consumedRows.length === 0) {
+          throw new ClientSafeError(
+            'Invalid, expired, or already used password recovery token.',
+            400
+          );
+        }
 
-      // Invalidate any other outstanding recovery tokens for this user
-      await tx
-        .update(passwordResetTokens)
-        .set({ consumedAt: now })
-        .where(
-          and(
-            eq(passwordResetTokens.userUid, tokenRecord.userUid),
-            isNull(passwordResetTokens.consumedAt)
-          )
-        );
+        // Invalidate any other outstanding recovery tokens for this user
+        await tx
+          .update(passwordResetTokens)
+          .set({ consumedAt: now })
+          .where(
+            and(
+              eq(passwordResetTokens.userUid, tokenRecord.userUid),
+              isNull(passwordResetTokens.consumedAt)
+            )
+          );
 
+        const userRows = await tx
+          .select()
+          .from(users)
+          .where(eq(users.uid, tokenRecord.userUid));
+        const targetUser = userRows[0];
+
+        if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
+          throw new ClientSafeError('Account is no longer active.', 400);
+        }
+
+        const nextProvider =
+          targetUser.authProvider === 'firebase' ? 'both' : targetUser.authProvider;
+
+        const [updated] = await tx
+          .update(users)
+          .set({
+            passwordHash: newPasswordHash,
+            authProvider: nextProvider,
+            tokenVersion: sql`${users.tokenVersion} + 1`,
+            updatedAt: now,
+          })
+          .where(eq(users.uid, targetUser.uid))
+          .returning();
+
+        return updated;
+      });
+
+      return sanitizeUserForClient(updatedUser);
+    }
+
+    // Otherwise verify and consume as a Firebase Authentication oobCode
+    const verifiedEmail = await verifyAndConsumeFirebaseOobCode(
+      cleanedToken,
+      newPassword
+    );
+
+    const updatedFirebaseUser = await db.transaction(async (tx) => {
       const userRows = await tx
         .select()
         .from(users)
-        .where(eq(users.uid, tokenRecord.userUid));
+        .where(eq(users.email, verifiedEmail));
       const targetUser = userRows[0];
 
       if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
         throw new ClientSafeError('Account is no longer active.', 400);
       }
+
+      await tx
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.userUid, targetUser.uid),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        );
 
       const nextProvider =
         targetUser.authProvider === 'firebase' ? 'both' : targetUser.authProvider;
@@ -535,7 +663,7 @@ export async function confirmPasswordRecoveryToken(
       return updated;
     });
 
-    return sanitizeUserForClient(updatedUser);
+    return sanitizeUserForClient(updatedFirebaseUser);
   } catch (error) {
     if (error instanceof ClientSafeError) throw error;
     console.error('Error confirming password recovery token:', error);

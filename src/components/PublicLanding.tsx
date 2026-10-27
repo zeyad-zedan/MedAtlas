@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   BookOpen,
   CheckCircle2,
@@ -43,6 +43,30 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
+
+  // Automatically detect Firebase Auth password-reset oobCode or recovery token in URL query string
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const urlCode =
+      params.get('oobCode')?.trim() ||
+      params.get('resetToken')?.trim() ||
+      params.get('token')?.trim() ||
+      '';
+    if (urlCode.length >= 20) {
+      setRecoveryToken(urlCode);
+      setAuthTab('reset');
+      setResetStep('confirm');
+      setAuthError(null);
+      setAuthSuccess(
+        'Recovery code detected from your password reset link. Enter your new password below.'
+      );
+      setAuthModalOpen(true);
+      // Strip sensitive recovery code from browser address bar & Referer history
+      const cleanUrl = window.location.pathname + window.location.hash;
+      window.history.replaceState({}, document.title, cleanUrl);
+    }
+  }, []);
 
   const openAuth = (tab: AuthTab) => {
     setAuthTab(tab);
@@ -702,16 +726,16 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                     htmlFor="auth-recovery-token"
                     className="block text-xs font-semibold text-slate-700 mb-1"
                   >
-                    Single-Use Password Recovery Token
+                    Recovery Code / Single-Use Reset Token
                   </label>
                   <input
                     id="auth-recovery-token"
                     type="text"
                     required
-                    minLength={32}
+                    minLength={20}
                     value={recoveryToken}
                     onChange={(e) => setRecoveryToken(e.target.value)}
-                    placeholder="Paste your 64-character recovery token"
+                    placeholder="Paste your recovery token or reset code"
                     className="w-full px-3 py-2 text-sm font-mono-tabular rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
                   />
                 </div>
@@ -750,7 +774,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                   : authTab === 'register'
                   ? 'Create Student Account'
                   : resetStep === 'request'
-                  ? 'Send Recovery Instructions'
+                  ? 'Send Password Reset Email'
                   : 'Verify Token & Update Password'}
               </button>
 
@@ -776,7 +800,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                       }}
                       className="text-slate-600 hover:text-slate-900 font-medium cursor-pointer"
                     >
-                      ← Back to request recovery instructions
+                      ← Back to request password reset email
                     </button>
                   )}
                 </div>

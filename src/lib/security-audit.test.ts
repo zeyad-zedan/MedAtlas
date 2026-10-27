@@ -9,6 +9,7 @@ import {
   validateSessionSecret,
   createServerSessionToken,
   verifyServerSessionToken,
+  verifyPassword,
   hashRecoveryToken,
   requireAuth,
   type AuthRequest,
@@ -19,7 +20,9 @@ import {
   ClientSafeError,
   evaluateServerExamDeadline,
   registerEmailPasswordUser,
+  findUserByEmail,
   getOrCreateUser,
+  dispatchFirebasePasswordResetEmail,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   linkPasswordToAuthenticatedAccount,
@@ -211,6 +214,22 @@ describe('Security & Reliability Audit Regression Suite', () => {
     });
     assert.equal(nextCalled, false);
     assert.equal(statusCaptured, 401);
+
+    // Old password must no longer authenticate; new password must authenticate
+    const userInDbAfterReset = await findUserByEmail(email);
+    assert.ok(userInDbAfterReset?.passwordHash);
+    assert.equal(
+      verifyPassword('InitialSecurePass123!', userInDbAfterReset.passwordHash),
+      false
+    );
+    assert.equal(
+      verifyPassword('UpdatedValidPass456!', userInDbAfterReset.passwordHash),
+      true
+    );
+
+    // Firebase Auth password-reset email dispatch works directly via configured Firebase project without PASSWORD_RESET_WEBHOOK_URL
+    const firebaseDispatched = await dispatchFirebasePasswordResetEmail(email);
+    assert.equal(firebaseDispatched, true);
   });
 
   // ==========================================================================

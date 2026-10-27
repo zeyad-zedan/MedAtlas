@@ -34,24 +34,42 @@ Key capabilities and security controls implemented in this release:
 
 ---
 
-## 3. Environment Configuration & Setup
+## 3. Production Environment Configuration & Deployment Instructions
 
 ### Prerequisites
 - **Node.js** v20+ (v22 recommended)
 - **PostgreSQL** database (Cloud SQL or Supabase PostgreSQL)
+- **Firebase Authentication** project configuration (`firebase-applet-config.json`, pre-configured for `pivotal-bedrock-c01dl`)
 
-### Required Environment Variables
-Copy `.env.example` to `.env` and configure:
-1. **`AUTH_SESSION_SECRET`** (**Required**):
-   Must be at least 32 characters with high entropy (no default fallback secret is allowed). Generate a secure 64-character hex secret with:
-   ```bash
-   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-   ```
-2. **PostgreSQL Connection Variables**:
-   - `SQL_HOST`, `SQL_DB_NAME`, `SQL_USER`, `SQL_PASSWORD` (application runtime pool)
-   - `SQL_ADMIN_USER`, `SQL_ADMIN_PASSWORD` (Drizzle schema migrations)
-3. **`PASSWORD_RESET_WEBHOOK_URL`** (*Optional*):
-   Outbound HTTPS webhook URL to deliver single-use password recovery tokens via your transactional email provider.
+### Required Production Environment Variables
+
+| Variable | Required | Purpose |
+| :--- | :--- | :--- |
+| `AUTH_SESSION_SECRET` | **Yes** | High-entropy secret (minimum 32 characters, at least 10 distinct characters; 64-character hex recommended) used to sign and verify HMAC-SHA256 local session tokens (`medatlas.v1.<payload>.<sig>`). The server fails fast at startup if missing, short, low-entropy, or set to a placeholder. Generate via: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `SQL_HOST` | **Yes** | Cloud SQL Unix socket path (`/cloudsql/<instance-connection-name>`) or PostgreSQL hostname/IP. |
+| `SQL_DB_NAME` | **Yes** | PostgreSQL database name (e.g., `postgres`). |
+| `SQL_USER` | **Yes** | PostgreSQL runtime application user account used by the Express server connection pool. |
+| `SQL_PASSWORD` | **Yes** | Password for `SQL_USER`. |
+| `SQL_ADMIN_USER` | **Migrations** | PostgreSQL administrative user used by Drizzle Kit when applying schema migrations. |
+| `SQL_ADMIN_PASSWORD` | **Migrations** | Password for `SQL_ADMIN_USER`. |
+| `APP_URL` | **Runtime** | Public base URL of the deployed application (automatically injected by Cloud Run / AI Studio runtime). |
+| `PORT` | **Optional** | HTTP server listening port (defaults to `3000`). |
+
+> **Note on Password Recovery (`PASSWORD_RESET_WEBHOOK_URL` Removed):**
+> No custom external webhook URL is required. Password recovery uses the configured **Firebase Authentication** service (`firebase-applet-config.json` / Identity Toolkit `accounts:sendOobCode` & `accounts:resetPassword`) together with PostgreSQL single-use SHA-256 hashed tokens (`password_reset_tokens` with 15-minute expiration, bounded rate limiting, and `users.token_version` session invalidation).
+
+### Password-Reset Endpoints & Request Formats
+
+1. **Initiate Password Reset (`POST /api/auth/forgot-password`)**
+   - **Rate Limit**: 6 requests per 60 seconds per `IP + email` (`forgotPasswordLimiter`).
+   - **Request Body**: `{ "email": "student@medschool.edu" }`
+   - **Behavior**: Invalidates any prior unconsumed tokens for the account, stores a new SHA-256 hashed single-use token with a 15-minute expiration in `password_reset_tokens`, triggers Firebase Authentication password-reset email delivery (`accounts:sendOobCode`), and returns an enumeration-safe `200 OK` response:
+     `{ "accepted": true, "message": "If an account exists for that email address, a password reset email has been dispatched via Firebase Authentication.", "expiresInMinutes": 15 }`
+
+2. **Complete Password Reset (`POST /api/auth/reset-password`)**
+   - **Rate Limit**: 10 requests per 60 seconds per `IP` (`resetPasswordLimiter`).
+   - **Request Body**: `{ "token": "<64-char-single-use-token-or-firebase-oobCode>", "newPassword": "<min-8-char-password>" }` (also accepts `"oobCode"` in place of `"token"`).
+   - **Behavior**: Rejects unauthenticated `{ email, newPassword }` requests with `400 Bad Request`. Atomically verifies and consumes the single-use token in PostgreSQL (or verifies/consumes the Firebase `oobCode`), updates `users.password_hash` with a salted `scrypt` digest, and increments `users.token_version` so all prior session tokens are immediately revoked.
 
 ### Commands
 1. **Install dependencies**:
@@ -80,3 +98,4 @@ Copy `.env.example` to `.env` and configure:
    # or run the pre-bundled production server:
    npm run start:prod
    ```
+

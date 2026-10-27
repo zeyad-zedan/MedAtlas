@@ -274,16 +274,24 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
 });
 
 /**
- * Step 2 of Password Recovery: Complete password reset using a verified single-use recovery token.
+ * Step 2 of Password Recovery: Complete password reset using a verified single-use recovery token
+ * or a Firebase Authentication password-reset oobCode.
  * Unauthenticated reset by { email, newPassword } alone is strictly rejected.
  */
 app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
   try {
-    const { token, newPassword } = req.body || {};
-    if (!token || typeof token !== 'string' || token.trim().length < 32) {
+    const { token, oobCode, newPassword } = req.body || {};
+    const recoverySecret =
+      typeof token === 'string' && token.trim().length > 0
+        ? token.trim()
+        : typeof oobCode === 'string' && oobCode.trim().length > 0
+        ? oobCode.trim()
+        : '';
+
+    if (!recoverySecret || recoverySecret.length < 20) {
       return res.status(400).json({
         error:
-          'A valid single-use password recovery token is required to reset a password.',
+          'A valid single-use password recovery token or Firebase reset code is required to reset a password.',
       });
     }
     if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
@@ -292,7 +300,7 @@ app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
         .json({ error: 'New password must be at least 8 characters long.' });
     }
 
-    await confirmPasswordRecoveryToken(token, newPassword);
+    await confirmPasswordRecoveryToken(recoverySecret, newPassword);
     return res.json({
       message:
         'Your password has been updated and prior sessions have been revoked. You may now sign in with your new password.',

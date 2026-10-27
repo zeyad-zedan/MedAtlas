@@ -1,15 +1,48 @@
-import { signInWithPopup, signOut } from 'firebase/auth';
+import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
 import { auth, googleAuthProvider } from './firebase.ts';
 
-// Store auth token in memory as required by security best practices
-let inMemoryAuthToken: string | null = null;
+const STORAGE_TOKEN_KEY = 'medatlas_session_token';
+
+let inMemoryAuthToken: string | null =
+  typeof window !== 'undefined' ? window.localStorage.getItem(STORAGE_TOKEN_KEY) : null;
 
 export function setAuthToken(token: string | null) {
   inMemoryAuthToken = token;
+  if (typeof window !== 'undefined') {
+    if (token) {
+      window.localStorage.setItem(STORAGE_TOKEN_KEY, token);
+    } else {
+      window.localStorage.removeItem(STORAGE_TOKEN_KEY);
+    }
+  }
 }
 
 export function getAuthToken(): string | null {
   return inMemoryAuthToken;
+}
+
+export function subscribeToAuthChanges(
+  onUserResolved: (user: UserProfile | null) => void
+): () => void {
+  const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+    try {
+      if (firebaseUser) {
+        const idToken = await firebaseUser.getIdToken();
+        setAuthToken(idToken);
+        const data = await api.getCurrentUser();
+        onUserResolved(data.user);
+      } else if (getAuthToken()) {
+        const data = await api.getCurrentUser();
+        onUserResolved(data.user);
+      } else {
+        onUserResolved(null);
+      }
+    } catch {
+      setAuthToken(null);
+      onUserResolved(null);
+    }
+  });
+  return unsubscribe;
 }
 
 async function apiRequest<T>(
@@ -31,6 +64,9 @@ async function apiRequest<T>(
   });
 
   if (!res.ok) {
+    if (res.status === 401) {
+      setAuthToken(null);
+    }
     let errMsg = `Request failed (${res.status})`;
     try {
       const errBody = await res.json();
@@ -85,18 +121,6 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({ email, password }),
-      }
-    );
-    setAuthToken(data.token);
-    return data.user;
-  },
-
-  loginWithDemoRole: async (role: 'student' | 'admin') => {
-    const data = await apiRequest<{ token: string; user: UserProfile }>(
-      '/api/auth/demo',
-      {
-        method: 'POST',
-        body: JSON.stringify({ role }),
       }
     );
     setAuthToken(data.token);

@@ -1,15 +1,15 @@
-import express, { Response, NextFunction } from 'express';
+import express, { type Response, type NextFunction } from 'express';
 import path from 'node:path';
-import { createServer as createViteServer } from 'vite';
 import * as dotenv from 'dotenv';
 import {
   requireAuth,
-  AuthRequest,
+  type AuthRequest,
   verifyPassword,
   createServerSessionToken,
 } from './src/middleware/auth.ts';
 import {
   ensureSeededDatabase,
+  isSoleAdminEmail,
   getOrCreateUser,
   registerEmailPasswordUser,
   findUserByEmail,
@@ -61,17 +61,17 @@ function rateLimit(maxRequests: number, windowMs: number) {
   };
 }
 
-// Middleware to verify database-backed Administrator role
+// Middleware to verify database-backed Administrator role (exclusively zeyadzedan098@gmail.com)
 const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required.' });
     }
     const dbUser = await getOrCreateUser(req.user.uid, req.user.email, req.user.name);
-    if (!dbUser || dbUser.role !== 'admin') {
+    if (!dbUser || dbUser.role !== 'admin' || !isSoleAdminEmail(dbUser.email)) {
       return res
         .status(403)
-        .json({ error: 'Forbidden: Administrator privileges are required for this operation.' });
+        .json({ error: 'Forbidden: Administrator privileges are restricted to the platform owner.' });
     }
     return next();
   } catch (error: any) {
@@ -148,28 +148,6 @@ app.post('/api/auth/login', rateLimit(20, 60_000), async (req, res) => {
     return res.json({ token, user: safeUser });
   } catch (error: any) {
     return res.status(500).json({ error: error.message || 'Login failed.' });
-  }
-});
-
-app.post('/api/auth/demo', rateLimit(30, 60_000), async (req, res) => {
-  try {
-    await ensureSeededDatabase();
-    const role = req.body?.role === 'admin' ? 'admin' : 'student';
-    const email =
-      role === 'admin' ? 'admin.demo@medatlas.edu' : 'student.demo@medatlas.edu';
-    const user = await findUserByEmail(email);
-    if (!user) {
-      return res.status(404).json({ error: 'Demo account not found.' });
-    }
-    const token = createServerSessionToken({
-      uid: user.uid,
-      email: user.email,
-      name: user.displayName,
-    });
-    const { passwordHash: _ph, ...safeUser } = user;
-    return res.json({ token, user: safeUser });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Demo login failed.' });
   }
 });
 
@@ -575,9 +553,10 @@ app.get('/api/admin/export-csv', requireAuth, requireAdmin, async (_req, res) =>
 // VITE DEV SERVER / PRODUCTION STATIC SERVING
 // ============================================================================
 async function startServer() {
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

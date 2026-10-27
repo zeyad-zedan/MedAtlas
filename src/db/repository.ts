@@ -22,6 +22,8 @@ import {
   selectPracticeQuestions,
   computeTopicPerformance,
   parseAndValidateCsvQuestions,
+} from '../lib/mcq-engine.ts';
+import type {
   OptionKey,
   OptionPermutation,
   DifficultyLevel,
@@ -30,11 +32,11 @@ import {
 } from '../lib/mcq-engine.ts';
 import { hashPassword } from '../middleware/auth.ts';
 
-const OWNER_ADMIN_EMAILS = new Set([
-  'zeyadzedan098@gmail.com',
-  'admin.demo@medatlas.edu',
-  (process.env.INITIAL_ADMIN_EMAIL || '').toLowerCase().trim(),
-].filter(Boolean));
+export const SOLE_ADMIN_EMAIL = 'zeyadzedan098@gmail.com';
+
+export function isSoleAdminEmail(email: string): boolean {
+  return email.toLowerCase().trim() === SOLE_ADMIN_EMAIL;
+}
 
 let isSeeded = false;
 
@@ -46,44 +48,6 @@ export async function ensureSeededDatabase() {
       isSeeded = true;
       return;
     }
-
-    // Seed default Demo Student and Demo Admin accounts
-    const demoStudentUid = 'demo-student-uid-001';
-    const demoAdminUid = 'demo-admin-uid-001';
-
-    await db
-      .insert(users)
-      .values([
-        {
-          uid: demoStudentUid,
-          email: 'student.demo@medatlas.edu',
-          displayName: 'Maya Lin, MS2',
-          passwordHash: hashPassword('StudentPass123!'),
-          role: 'student',
-          subscriptionTier: 'free_trial',
-          subscriptionStatus: 'active',
-          emailVerified: true,
-        },
-        {
-          uid: demoAdminUid,
-          email: 'admin.demo@medatlas.edu',
-          displayName: 'Dr. Julian Vance (Curriculum Director)',
-          passwordHash: hashPassword('AdminPass123!'),
-          role: 'admin',
-          subscriptionTier: 'free_trial',
-          subscriptionStatus: 'active',
-          emailVerified: true,
-        },
-      ])
-      .onConflictDoNothing();
-
-    const insertedQuestionIds: Array<{
-      id: number;
-      subjectId: number;
-      lectureId: number;
-      correctAnswer: OptionKey;
-      questionSnapshotJson: string;
-    }> = [];
 
     for (const subjSeed of INITIAL_CURRICULUM_SEED) {
       const [insertedSubj] = await db
@@ -141,134 +105,30 @@ export async function ensureSeededDatabase() {
             `${subjSeed.title}|${lectSeed.title}|${qSeed.questionText}|${qSeed.optionA}|${qSeed.optionB}|${qSeed.optionC}|${qSeed.optionD}`
           );
 
-          const [insertedQ] = await db
-            .insert(questions)
-            .values({
-              subjectId: insertedSubj.id,
-              lectureId: insertedLect.id,
-              questionBankId: practiceBank.id,
-              questionText: qSeed.questionText,
-              optionA: qSeed.optionA,
-              optionB: qSeed.optionB,
-              optionC: qSeed.optionC,
-              optionD: qSeed.optionD,
-              correctAnswer: qSeed.correctAnswer,
-              explanation: qSeed.explanation,
-              explanationA: qSeed.explanationA,
-              explanationB: qSeed.explanationB,
-              explanationC: qSeed.explanationC,
-              explanationD: qSeed.explanationD,
-              difficulty: qSeed.difficulty,
-              tags: qSeed.tags,
-              diagramSvg: qSeed.diagramSvg || '',
-              status: 'published',
-              version: 1,
-              contentHash,
-            })
-            .returning();
-
-          insertedQuestionIds.push({
-            id: insertedQ.id,
+          await db.insert(questions).values({
             subjectId: insertedSubj.id,
             lectureId: insertedLect.id,
+            questionBankId: practiceBank.id,
+            questionText: qSeed.questionText,
+            optionA: qSeed.optionA,
+            optionB: qSeed.optionB,
+            optionC: qSeed.optionC,
+            optionD: qSeed.optionD,
             correctAnswer: qSeed.correctAnswer,
-            questionSnapshotJson: JSON.stringify({
-              id: insertedQ.id,
-              subjectTitle: subjSeed.title,
-              lectureTitle: lectSeed.title,
-              questionText: qSeed.questionText,
-              optionA: qSeed.optionA,
-              optionB: qSeed.optionB,
-              optionC: qSeed.optionC,
-              optionD: qSeed.optionD,
-              correctAnswer: qSeed.correctAnswer,
-              explanation: qSeed.explanation,
-              explanationA: qSeed.explanationA,
-              explanationB: qSeed.explanationB,
-              explanationC: qSeed.explanationC,
-              explanationD: qSeed.explanationD,
-              difficulty: qSeed.difficulty,
-              tags: qSeed.tags,
-            }),
+            explanation: qSeed.explanation,
+            explanationA: qSeed.explanationA,
+            explanationB: qSeed.explanationB,
+            explanationC: qSeed.explanationC,
+            explanationD: qSeed.explanationD,
+            difficulty: qSeed.difficulty,
+            tags: qSeed.tags,
+            diagramSvg: qSeed.diagramSvg || '',
+            status: 'published',
+            version: 1,
+            contentHash,
           });
         }
       }
-    }
-
-    // Seed 2 realistic completed sessions & 2 bookmarks for the Demo Student so the dashboard has real database records
-    if (insertedQuestionIds.length >= 6) {
-      const firstSet = insertedQuestionIds.slice(0, 4);
-      const orderItems1 = firstSet.map((q) => ({
-        questionId: q.id,
-        permutation: { A: 'A', B: 'B', C: 'C', D: 'D' },
-        selectedDisplayed: q.correctAnswer,
-        selectedCanonical: q.correctAnswer,
-        submitted: true,
-      }));
-      // Make 1 of the 4 incorrect for realistic accuracy (75%)
-      orderItems1[3].selectedDisplayed = orderItems1[3].selectedCanonical === 'A' ? 'B' : 'A';
-      orderItems1[3].selectedCanonical = orderItems1[3].selectedDisplayed as OptionKey;
-
-      const [session1] = await db
-        .insert(examSessions)
-        .values({
-          userUid: demoStudentUid,
-          title: 'Eukaryotic Cell Ultrastructure — Study Session',
-          mode: 'study',
-          subjectId: firstSet[0].subjectId,
-          lectureId: firstSet[0].lectureId,
-          status: 'completed',
-          totalQuestions: 4,
-          correctCount: 3,
-          incorrectCount: 1,
-          unansweredCount: 0,
-          scorePercentage: 75,
-          elapsedSeconds: 310,
-          shuffleOptions: false,
-          questionOrderJson: JSON.stringify(orderItems1),
-          completedAt: new Date(Date.now() - 1000 * 60 * 60 * 18),
-        })
-        .returning();
-
-      for (let i = 0; i < firstSet.length; i++) {
-        const q = firstSet[i];
-        const chosen = orderItems1[i].selectedCanonical as OptionKey;
-        await db.insert(questionAttempts).values({
-          sessionId: session1.id,
-          userUid: demoStudentUid,
-          questionId: q.id,
-          subjectId: q.subjectId,
-          lectureId: q.lectureId,
-          selectedOption: chosen,
-          correctOptionSnapshot: q.correctAnswer,
-          isCorrect: chosen === q.correctAnswer,
-          questionSnapshotJson: q.questionSnapshotJson,
-          timeSpentSeconds: 75,
-        });
-      }
-
-      // Bookmark 2 questions for demo student
-      await db.insert(bookmarks).values([
-        {
-          userUid: demoStudentUid,
-          questionId: insertedQuestionIds[0].id,
-          note: 'Review Mannose-6-Phosphate I-cell disease mechanism before block exam.',
-        },
-        {
-          userUid: demoStudentUid,
-          questionId: insertedQuestionIds[4].id,
-          note: 'Compare Vitamin C hydroxylation in RER vs Copper lysyl oxidase extracellularly.',
-        },
-      ]);
-
-      await db.insert(adminAuditLogs).values({
-        adminUid: demoAdminUid,
-        adminEmail: 'admin.demo@medatlas.edu',
-        action: 'INITIALIZE_CURRICULUM',
-        targetType: 'system',
-        targetId: 'seed-v1',
-        details: 'Initialized foundational medical subjects, lectures, and peer-reviewed MCQ banks.',
-      });
     }
 
     isSeeded = true;
@@ -286,7 +146,7 @@ export async function getOrCreateUser(
   try {
     await ensureSeededDatabase();
     const normalizedEmail = email.toLowerCase().trim();
-    const isBootstrapAdmin = OWNER_ADMIN_EMAILS.has(normalizedEmail);
+    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
     const defaultName =
       displayName?.trim() || normalizedEmail.split('@')[0] || 'Medical Student';
 
@@ -297,13 +157,13 @@ export async function getOrCreateUser(
 
     if (existingByUid.length > 0) {
       const user = existingByUid[0];
-      if (isBootstrapAdmin && user.role !== 'admin') {
-        const [promoted] = await db
+      if (user.role !== expectedRole) {
+        const [updatedRoleUser] = await db
           .update(users)
-          .set({ role: 'admin', updatedAt: new Date() })
+          .set({ role: expectedRole, updatedAt: new Date() })
           .where(eq(users.uid, uid))
           .returning();
-        return promoted;
+        return updatedRoleUser;
       }
       return user;
     }
@@ -318,7 +178,7 @@ export async function getOrCreateUser(
         .update(users)
         .set({
           uid,
-          role: isBootstrapAdmin ? 'admin' : existingByEmail[0].role,
+          role: expectedRole,
           updatedAt: new Date(),
         })
         .where(eq(users.email, normalizedEmail))
@@ -332,7 +192,7 @@ export async function getOrCreateUser(
         uid,
         email: normalizedEmail,
         displayName: defaultName,
-        role: isBootstrapAdmin ? 'admin' : 'student',
+        role: expectedRole,
         subscriptionTier: 'free_trial',
         subscriptionStatus: 'active',
         emailVerified: true,
@@ -341,6 +201,7 @@ export async function getOrCreateUser(
         target: users.uid,
         set: {
           email: normalizedEmail,
+          role: expectedRole,
           updatedAt: new Date(),
         },
       })
@@ -361,18 +222,33 @@ export async function registerEmailPasswordUser(
   try {
     await ensureSeededDatabase();
     const normalizedEmail = email.toLowerCase().trim();
+    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
+    const passwordHash = hashPassword(password);
+
     const existing = await db
       .select()
       .from(users)
       .where(eq(users.email, normalizedEmail));
 
     if (existing.length > 0) {
+      // If account was previously created via Google Sign-In without a passwordHash, attach the passwordHash
+      if (!existing[0].passwordHash) {
+        const [linked] = await db
+          .update(users)
+          .set({
+            displayName: displayName.trim() || existing[0].displayName,
+            passwordHash,
+            role: expectedRole,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.email, normalizedEmail))
+          .returning();
+        return linked;
+      }
       throw new Error('An account with this email address already exists.');
     }
 
     const uid = `usr_${computeContentHash(`${normalizedEmail}_${Date.now()}`)}`;
-    const isBootstrapAdmin = OWNER_ADMIN_EMAILS.has(normalizedEmail);
-    const passwordHash = hashPassword(password);
 
     const [created] = await db
       .insert(users)
@@ -381,7 +257,7 @@ export async function registerEmailPasswordUser(
         email: normalizedEmail,
         displayName: displayName.trim() || normalizedEmail.split('@')[0],
         passwordHash,
-        role: isBootstrapAdmin ? 'admin' : 'student', // Public registration never grants admin unless bootstrap owner
+        role: expectedRole,
         subscriptionTier: 'free_trial',
         subscriptionStatus: 'active',
         emailVerified: true,
@@ -399,11 +275,24 @@ export async function registerEmailPasswordUser(
 export async function findUserByEmail(email: string) {
   try {
     await ensureSeededDatabase();
+    const normalizedEmail = email.toLowerCase().trim();
     const rows = await db
       .select()
       .from(users)
-      .where(eq(users.email, email.toLowerCase().trim()));
-    return rows[0] || null;
+      .where(eq(users.email, normalizedEmail));
+    const user = rows[0] || null;
+    if (!user) return null;
+
+    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
+    if (user.role !== expectedRole) {
+      const [normalizedUser] = await db
+        .update(users)
+        .set({ role: expectedRole, updatedAt: new Date() })
+        .where(eq(users.uid, user.uid))
+        .returning();
+      return normalizedUser;
+    }
+    return user;
   } catch (error) {
     console.error('Error finding user by email:', error);
     throw new Error('Database lookup failed.', { cause: error });

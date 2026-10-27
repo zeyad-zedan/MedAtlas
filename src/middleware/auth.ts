@@ -1,4 +1,4 @@
-import { Request, Response, NextFunction } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
 import { adminAuth } from '../lib/firebase-admin.ts';
 

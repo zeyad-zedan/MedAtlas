@@ -1,4 +1,4 @@
-import { OptionKey, DifficultyLevel } from '../lib/mcq-engine.ts';
+import type { OptionKey, DifficultyLevel } from '../lib/mcq-engine.ts';
 
 export interface SeedSubject {
   slug: string;

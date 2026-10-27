@@ -11,7 +11,7 @@ import {
   ArrowRight,
   X,
 } from 'lucide-react';
-import { api, UserProfile } from '../lib/api.ts';
+import { api, type UserProfile } from '../lib/api.ts';
 
 interface PublicLandingProps {
   catalog: {
@@ -75,20 +75,6 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
     }
   };
 
-  const handleDemoLogin = async (role: 'student' | 'admin') => {
-    setAuthError(null);
-    setAuthLoading(true);
-    try {
-      const user = await api.loginWithDemoRole(role);
-      setAuthModalOpen(false);
-      onAuthenticated(user, role === 'admin' ? 'admin' : 'dashboard');
-    } catch (err: any) {
-      setAuthError(err.message || 'Demo login failed.');
-    } finally {
-      setAuthLoading(false);
-    }
-  };
-
   const handleGoogleLogin = async () => {
     setAuthError(null);
     setAuthLoading(true);
@@ -99,7 +85,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
     } catch (err: any) {
       setAuthError(
         err.message ||
-          'Google sign-in popup could not complete. You can also sign in with Email & Password or Demo Account below.'
+          'Google sign-in popup could not complete. You can also sign in with Email & Password below.'
       );
     } finally {
       setAuthLoading(false);
@@ -193,20 +179,18 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDemoLogin('student')}
+                  onClick={() => openAuth('login')}
                   disabled={authLoading}
                   className="px-4 py-3 text-sm font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Launch Student Demo
+                  Sign In to Account
                 </button>
-                <button
-                  type="button"
-                  onClick={() => handleDemoLogin('admin')}
-                  disabled={authLoading}
+                <a
+                  href="#subjects"
                   className="px-4 py-3 text-sm font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200/70 rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Explore Admin Console
-                </button>
+                  Browse Curriculum
+                </a>
               </div>
 
               {/* Real Database Catalog Metrics */}
@@ -731,34 +715,15 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
               </button>
             </form>
 
-            <div className="pt-3 border-t border-slate-200 space-y-2.5">
+            <div className="pt-3 border-t border-slate-200">
               <button
                 type="button"
                 onClick={handleGoogleLogin}
                 disabled={authLoading}
-                className="w-full py-2 px-4 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer"
+                className="w-full py-2.5 px-4 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors cursor-pointer"
               >
                 Continue with Google Sign-In
               </button>
-
-              <div className="grid grid-cols-2 gap-2 pt-1">
-                <button
-                  type="button"
-                  onClick={() => handleDemoLogin('student')}
-                  disabled={authLoading}
-                  className="py-2 px-3 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
-                >
-                  Instant Demo Student
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleDemoLogin('admin')}
-                  disabled={authLoading}
-                  className="py-2 px-3 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer"
-                >
-                  Instant Demo Admin
-                </button>
-              </div>
             </div>
           </div>
         </div>

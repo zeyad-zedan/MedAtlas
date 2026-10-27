@@ -14,7 +14,7 @@ import {
   FileText,
   XCircle,
 } from 'lucide-react';
-import { api, UserProfile } from '../lib/api.ts';
+import { api, type UserProfile } from '../lib/api.ts';
 
 // ============================================================================
 // 1. STUDENT DASHBOARD & ANALYTICS VIEW

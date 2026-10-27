@@ -3,6 +3,7 @@
   "appId": "1:23945731098:web:83ce46614427939b0985a3",
   "apiKey": "AIzaSyDFsd3F5dseFGKuJA5uKxrhH1sFZKbECzE",
   "authDomain": "pivotal-bedrock-c01dl.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-7f062ff2-af3a-44a0-a020-c5ec5d0545f2",
   "storageBucket": "pivotal-bedrock-c01dl.firebasestorage.app",
   "messagingSenderId": "23945731098",
   "measurementId": "",

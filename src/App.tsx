@@ -18,7 +18,7 @@ import {
   User,
   X,
 } from 'lucide-react';
-import { api, UserProfile } from './lib/api.ts';
+import { api, subscribeToAuthChanges, type UserProfile } from './lib/api.ts';
 import { PublicLanding } from './components/PublicLanding.tsx';
 import { McqSessionPlayer } from './components/McqSessionPlayer.tsx';
 import {
@@ -34,6 +34,7 @@ import { AdminConsole } from './components/AdminConsole.tsx';
 
 export default function App() {
   const [user, setUser] = useState<UserProfile | null>(null);
+  const [initializingAuth, setInitializingAuth] = useState(true);
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
@@ -93,16 +94,11 @@ export default function App() {
 
   useEffect(() => {
     loadCatalog();
-    // Support ?autostart=1 for automated browser verification
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('autostart') === '1') {
-      api
-        .loginWithDemoRole('student')
-        .then((demoUser) => {
-          setUser(demoUser);
-        })
-        .catch(() => {});
-    }
+    const unsubscribe = subscribeToAuthChanges((resolvedUser) => {
+      setUser(resolvedUser);
+      setInitializingAuth(false);
+    });
+    return () => unsubscribe();
   }, [loadCatalog]);
 
   useEffect(() => {
@@ -153,16 +149,13 @@ export default function App() {
     }
   };
 
-  const handleSwitchDemoRole = async (targetRole: 'student' | 'admin') => {
-    try {
-      const switchedUser = await api.loginWithDemoRole(targetRole);
-      setUser(switchedUser);
-      setActiveSession(null);
-      setActiveTab(targetRole === 'admin' ? 'admin' : 'dashboard');
-    } catch (err: any) {
-      setGlobalError(err.message || 'Role switch failed.');
-    }
-  };
+  if (initializingAuth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC] text-slate-600 text-sm">
+        Loading MedAtlas MCQ...
+      </div>
+    );
+  }
 
   if (!user) {
     return (
@@ -233,37 +226,18 @@ export default function App() {
             <p className="font-bold text-slate-900 truncate">{user.displayName}</p>
             <p className="text-slate-500 truncate">{user.email}</p>
             <p className="text-[11px] font-mono-tabular text-slate-400 uppercase mt-0.5">
-              Role: {user.role} · Free Trial
+              {user.role === 'admin' ? 'Platform Administrator' : 'Medical Student'} · Free Trial
             </p>
           </div>
 
-          <div className="flex items-center gap-1.5">
-            {user.role === 'student' ? (
-              <button
-                type="button"
-                onClick={() => handleSwitchDemoRole('admin')}
-                className="flex-1 py-1.5 px-2 text-[11px] font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
-              >
-                Switch to Admin Demo
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => handleSwitchDemoRole('student')}
-                className="flex-1 py-1.5 px-2 text-[11px] font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
-              >
-                Switch to Student Demo
-              </button>
-            )}
-            <button
-              type="button"
-              aria-label="Log out"
-              onClick={handleLogout}
-              className="p-1.5 text-slate-500 hover:text-red-700 bg-slate-100 hover:bg-red-50 rounded-md cursor-pointer"
-            >
-              <LogOut className="w-4 h-4" />
-            </button>
-          </div>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="w-full flex items-center justify-center gap-2 py-2 px-3 text-xs font-semibold text-slate-700 hover:text-red-700 bg-slate-100 hover:bg-red-50 rounded-lg transition-colors cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+            <span>Sign Out</span>
+          </button>
         </div>
       </aside>
 
@@ -292,7 +266,9 @@ export default function App() {
           <div className="hidden sm:flex items-center gap-6 text-xs text-slate-500 font-mono-tabular">
             <span>{user.displayName}</span>
             <span>·</span>
-            <span>Access: Free Trial Unlocked</span>
+            <span>
+              {user.role === 'admin' ? 'Administrator Access' : 'Access: Free Trial Unlocked'}
+            </span>
           </div>
 
           <div className="flex items-center shrink-0">
@@ -335,16 +311,9 @@ export default function App() {
             </div>
             <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2">
               <span className="text-xs text-slate-500 truncate">{user.email}</span>
-              <button
-                type="button"
-                onClick={() => {
-                  setMobileMenuOpen(false);
-                  handleSwitchDemoRole(user.role === 'student' ? 'admin' : 'student');
-                }}
-                className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md whitespace-nowrap cursor-pointer"
-              >
-                {user.role === 'student' ? 'Switch to Admin Demo' : 'Switch to Student Demo'}
-              </button>
+              <span className="text-[11px] font-mono-tabular text-slate-400 uppercase">
+                {user.role === 'admin' ? 'Admin' : 'Student'}
+              </span>
             </div>
           </div>
         )}

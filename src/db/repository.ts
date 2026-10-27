@@ -23,6 +23,7 @@ import {
   selectPracticeQuestions,
   computeTopicPerformance,
   parseAndValidateCsvQuestions,
+  sanitizeSvgDiagram,
   OPTION_KEYS,
 } from '../lib/mcq-engine.ts';
 import type {
@@ -38,6 +39,7 @@ import {
   generateRecoveryToken,
   hashRecoveryToken,
   hashEmailForTombstone,
+  recordUserSessionRevocation,
 } from '../middleware/auth.ts';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import firebaseConfig from '../../firebase-applet-config.json' with { type: 'json' };
@@ -45,7 +47,9 @@ import firebaseConfig from '../../firebase-applet-config.json' with { type: 'jso
 export const OWNER_ADMIN_EMAIL = 'zeyadzedan098@gmail.com';
 export const EXAM_SUBMISSION_GRACE_SECONDS = 15;
 export const GENERIC_PASSWORD_RECOVERY_MESSAGE =
-  'If an account exists for that email address, a password reset email has been dispatched via Firebase Authentication.';
+  'If an eligible account exists for that email address, password recovery instructions have been dispatched.';
+
+const ADMIN_BOOTSTRAP_ADVISORY_LOCK_ID = 84729103;
 
 /**
  * Error class representing messages that are safe to return to the client
@@ -82,7 +86,28 @@ export function sanitizeUserForClient<T extends { passwordHash?: string | null }
 }
 
 /**
- * Looks up an already-existing active user by UID without creating or resurrecting accounts.
+ * Verifies in PostgreSQL that the acting user is currently an active, non-deleted administrator.
+ */
+export async function assertActiveAdminInDb(adminUid: string) {
+  if (!adminUid || typeof adminUid !== 'string') {
+    throw new ClientSafeError('Forbidden: Administrator privileges required.', 403);
+  }
+  const rows = await db.select().from(users).where(eq(users.uid, adminUid));
+  const actor = rows[0];
+  if (
+    !actor ||
+    actor.accountStatus !== 'active' ||
+    actor.deletedAt !== null ||
+    actor.role !== 'admin'
+  ) {
+    throw new ClientSafeError('Forbidden: Administrator privileges required.', 403);
+  }
+  return actor;
+}
+
+/**
+ * Looks up an already-existing active user by UID without creating or resurrecting accounts,
+ * and NEVER auto-promotes local or unverified accounts to administrator.
  */
 export async function getAuthenticatedUserByUid(uid: string) {
   const tombstones = await db
@@ -100,22 +125,16 @@ export async function getAuthenticatedUserByUid(uid: string) {
     return null;
   }
 
-  if (isOwnerAdminEmail(user.email) && user.role !== 'admin') {
-    const [promotedOwner] = await db
-      .update(users)
-      .set({ role: 'admin', updatedAt: new Date() })
-      .where(eq(users.uid, uid))
-      .returning();
-    return promotedOwner;
-  }
-
   return user;
 }
 
 /**
  * Synchronizes or provisions a user authenticated via a verified Firebase ID token,
  * or returns the existing database profile for a local session user.
- * Never resurrects deleted accounts and never overwrites an existing user's UID.
+ * - Never resurrects deleted accounts and never overwrites an existing user's UID or bound email.
+ * - Provisions the initial owner administrator ONLY when backed by a verified Firebase Authentication
+ *   identity (`authType === 'firebase' && emailVerified === true`), serialized under a PostgreSQL
+ *   transaction advisory lock so concurrent first-admin requests cannot race.
  */
 export async function getOrCreateUser(
   uid: string,
@@ -130,11 +149,13 @@ export async function getOrCreateUser(
   try {
     await ensureSeededDatabase();
     const normalizedEmail = email.toLowerCase().trim();
+    const isVerifiedFirebaseIdentity =
+      options?.authType === 'firebase' && options?.emailVerified === true;
     const isOwner = isOwnerAdminEmail(normalizedEmail);
     const defaultName =
       displayName?.trim() || normalizedEmail.split('@')[0] || 'Medical Student';
 
-    // 1. Check tombstone table first so deleted UIDs can never be resurrected
+    // 1. Check tombstone table first (by UID and emailHash) so deleted accounts can never be resurrected
     const tombstoneRows = await db
       .select()
       .from(deletedAccounts)
@@ -152,70 +173,123 @@ export async function getOrCreateUser(
 
     if (existingByUid.length > 0) {
       const user = existingByUid[0];
-      if (user.accountStatus !== 'active' || user.deletedAt !== null) {
-        throw new ClientSafeError('Unauthorized: This account has been deactivated or deleted.', 401);
+      if (user.deletedAt !== null || user.accountStatus === 'deleted') {
+        throw new ClientSafeError(
+          'Unauthorized: This account has been deactivated or deleted.',
+          401
+        );
       }
-      if (isOwner && user.role !== 'admin') {
-        const [promotedOwner] = await db
-          .update(users)
-          .set({ role: 'admin', updatedAt: new Date() })
-          .where(eq(users.uid, uid))
-          .returning();
-        return promotedOwner;
+      if (user.accountStatus !== 'active') {
+        throw new ClientSafeError(
+          'Forbidden: This account is suspended or inactive.',
+          403
+        );
+      }
+      // Prevent silent account or administrator reassignment if email changed on provider
+      if (user.email.toLowerCase().trim() !== normalizedEmail) {
+        throw new ClientSafeError(
+          'Conflict: Authenticated email address does not match the email bound to this account.',
+          409
+        );
+      }
+
+      // Only promote an existing verified Firebase owner account if it was not yet marked admin
+      if (
+        isOwner &&
+        user.role !== 'admin' &&
+        isVerifiedFirebaseIdentity &&
+        user.authProvider !== 'local' &&
+        user.emailVerified === true
+      ) {
+        return await db.transaction(async (tx) => {
+          await tx.execute(
+            sql`SELECT pg_advisory_xact_lock(${ADMIN_BOOTSTRAP_ADVISORY_LOCK_ID})`
+          );
+          const [promotedOwner] = await tx
+            .update(users)
+            .set({ role: 'admin', updatedAt: new Date() })
+            .where(eq(users.uid, uid))
+            .returning();
+          return promotedOwner;
+        });
       }
       return user;
     }
 
     // Local session tokens must correspond to an already-registered database row;
     // never auto-create a user from a local token if the row was deleted.
-    if (options?.authType === 'local' || options?.allowCreate === false || uid.startsWith('usr_')) {
+    if (
+      options?.authType === 'local' ||
+      options?.allowCreate === false ||
+      uid.startsWith('usr_')
+    ) {
       throw new ClientSafeError('Unauthorized: Account no longer exists.', 401);
     }
 
-    // 3. For Firebase-authenticated users, require verified email before provisioning
-    if (options?.emailVerified === false) {
+    // 3. For Firebase-authenticated users, strictly require emailVerified === true
+    if (options?.emailVerified !== true) {
       throw new ClientSafeError(
         'Forbidden: A verified email address is required to create or access an account.',
         403
       );
     }
 
-    // 4. Check if another account already owns this email address.
-    // Never overwrite an existing account's UID!
-    const existingByEmail = await db
-      .select()
-      .from(users)
-      .where(eq(users.email, normalizedEmail));
-
-    if (existingByEmail.length > 0) {
-      const existingUser = existingByEmail[0];
-      if (existingUser.uid !== uid) {
-        throw new ClientSafeError(
-          'An account with this email address already exists under a different sign-in method. Please sign in using your original credentials.',
-          409
+    // 4. Serialize creation & initial admin bootstrap inside a PostgreSQL transaction with an advisory lock
+    return await db.transaction(async (tx) => {
+      if (isOwner) {
+        await tx.execute(
+          sql`SELECT pg_advisory_xact_lock(${ADMIN_BOOTSTRAP_ADVISORY_LOCK_ID})`
         );
       }
-      return existingUser;
-    }
 
-    const initialRole = isOwner ? 'admin' : 'student';
-    const [created] = await db
-      .insert(users)
-      .values({
-        uid,
-        email: normalizedEmail,
-        displayName: defaultName,
-        authProvider: 'firebase',
-        role: initialRole,
-        subscriptionTier: 'free_trial',
-        subscriptionStatus: 'active',
-        accountStatus: 'active',
-        tokenVersion: 1,
-        emailVerified: true,
-      })
-      .returning();
+      // Re-check UID inside transaction in case of concurrent requests from the same verified user
+      const concurrentByUid = await tx
+        .select()
+        .from(users)
+        .where(eq(users.uid, uid));
+      if (concurrentByUid.length > 0) {
+        return concurrentByUid[0];
+      }
 
-    return created;
+      // Check if another account already owns this email address. Never overwrite an existing account's UID!
+      const existingByEmail = await tx
+        .select()
+        .from(users)
+        .where(eq(users.email, normalizedEmail));
+
+      if (existingByEmail.length > 0) {
+        const existingUser = existingByEmail[0];
+        if (existingUser.uid !== uid) {
+          throw new ClientSafeError(
+            'An account with this email address already exists under a different sign-in method. Please sign in using your original credentials.',
+            409
+          );
+        }
+        return existingUser;
+      }
+
+      // Grant initial owner admin role ONLY to the verified Firebase owner identity
+      const initialRole =
+        isVerifiedFirebaseIdentity && isOwner ? 'admin' : 'student';
+
+      const [created] = await tx
+        .insert(users)
+        .values({
+          uid,
+          email: normalizedEmail,
+          displayName: defaultName,
+          authProvider: 'firebase',
+          role: initialRole,
+          subscriptionTier: 'free_trial',
+          subscriptionStatus: 'active',
+          accountStatus: 'active',
+          tokenVersion: 1,
+          emailVerified: true,
+        })
+        .returning();
+
+      return created;
+    });
   } catch (error: any) {
     if (error instanceof ClientSafeError) throw error;
     if (error?.code === '23505') {
@@ -231,7 +305,10 @@ export async function getOrCreateUser(
 
 /**
  * Registers a brand-new local email/password user.
- * Security guarantee: NEVER attaches a password to an existing user account (whether local or provider-based).
+ * Security guarantees:
+ * 1. NEVER grants administrator privileges during local registration, even if email matches OWNER_ADMIN_EMAIL.
+ * 2. NEVER marks a newly registered local account as emailVerified = true without email verification.
+ * 3. NEVER attaches a password to an existing user account (whether local or provider-based).
  */
 export async function registerEmailPasswordUser(
   email: string,
@@ -254,7 +331,6 @@ export async function registerEmailPasswordUser(
       );
     }
 
-    const isOwner = isOwnerAdminEmail(normalizedEmail);
     const passwordHash = hashPassword(password);
 
     const existing = await db
@@ -271,9 +347,19 @@ export async function registerEmailPasswordUser(
     }
 
     const uid = `usr_${computeContentHash(`${normalizedEmail}_${Date.now()}_${Math.random()}`)}`;
-    const initialRole = isOwner ? 'admin' : 'student';
 
     const created = await db.transaction(async (tx) => {
+      const concurrentExisting = await tx
+        .select()
+        .from(users)
+        .where(eq(users.email, normalizedEmail));
+      if (concurrentExisting.length > 0) {
+        throw new ClientSafeError(
+          'An account with this email address already exists. Please sign in instead.',
+          409
+        );
+      }
+
       // Clear any historical email-hash tombstone if this email is re-registering fresh with a brand-new UID
       await tx
         .delete(deletedAccounts)
@@ -287,12 +373,12 @@ export async function registerEmailPasswordUser(
           displayName: displayName.trim(),
           passwordHash,
           authProvider: 'local',
-          role: initialRole,
+          role: 'student',
           subscriptionTier: 'free_trial',
           subscriptionStatus: 'active',
           accountStatus: 'active',
           tokenVersion: 1,
-          emailVerified: true,
+          emailVerified: false,
         })
         .returning();
 
@@ -313,6 +399,9 @@ export async function registerEmailPasswordUser(
   }
 }
 
+/**
+ * Looks up an active user by email without ever mutating roles or promoting unverified users.
+ */
 export async function findUserByEmail(email: string) {
   try {
     await ensureSeededDatabase();
@@ -325,15 +414,6 @@ export async function findUserByEmail(email: string) {
     if (!user || user.accountStatus !== 'active' || user.deletedAt !== null) {
       return null;
     }
-
-    if (isOwnerAdminEmail(normalizedEmail) && user.role !== 'admin') {
-      const [promotedOwner] = await db
-        .update(users)
-        .set({ role: 'admin', updatedAt: new Date() })
-        .where(eq(users.uid, user.uid))
-        .returning();
-      return promotedOwner;
-    }
     return user;
   } catch (error) {
     console.error('Error finding user by email:', error);
@@ -341,11 +421,175 @@ export async function findUserByEmail(email: string) {
   }
 }
 
+const DEFAULT_TRUSTED_RECOVERY_ORIGINS = [
+  'https://ais-dev-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app',
+  'https://ais-pre-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app',
+];
+
+/**
+ * Validates and normalizes the recovery origin used to construct password-reset links.
+ * Rejects untrusted domains, non-HTTP(S) schemes, credentials in URLs, or path/query injection
+ * to prevent open-redirect and host-header poisoning attacks.
+ */
+export function validateTrustedRecoveryOrigin(
+  candidateOrigin?: string | null
+): string {
+  const allowedOrigins = new Set<string>(DEFAULT_TRUSTED_RECOVERY_ORIGINS);
+
+  const configuredAppUrl = process.env.APP_URL?.trim();
+  if (
+    configuredAppUrl &&
+    configuredAppUrl !== 'MY_APP_URL' &&
+    configuredAppUrl.startsWith('http')
+  ) {
+    try {
+      allowedOrigins.add(new URL(configuredAppUrl).origin);
+    } catch {
+      // ignore invalid APP_URL placeholder
+    }
+  }
+
+  const extraOrigins = process.env.ALLOWED_RECOVERY_ORIGINS?.split(',') || [];
+  for (const raw of extraOrigins) {
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    try {
+      allowedOrigins.add(new URL(trimmed).origin);
+    } catch {
+      // ignore malformed entry
+    }
+  }
+
+  if (process.env.NODE_ENV !== 'production') {
+    allowedOrigins.add('http://localhost:3000');
+    allowedOrigins.add('http://127.0.0.1:3000');
+  }
+
+  const defaultCanonicalOrigin =
+    configuredAppUrl &&
+    configuredAppUrl !== 'MY_APP_URL' &&
+    configuredAppUrl.startsWith('http')
+      ? new URL(configuredAppUrl).origin
+      : process.env.NODE_ENV === 'production'
+      ? DEFAULT_TRUSTED_RECOVERY_ORIGINS[0]
+      : 'http://localhost:3000';
+
+  if (candidateOrigin === undefined || candidateOrigin === null || candidateOrigin.trim() === '') {
+    return defaultCanonicalOrigin;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidateOrigin.trim());
+  } catch {
+    throw new ClientSafeError('Invalid password recovery origin URL.', 400);
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new ClientSafeError('Invalid password recovery origin protocol.', 400);
+  }
+  if (parsed.username || parsed.password) {
+    throw new ClientSafeError('Credentials are not permitted in recovery origin.', 400);
+  }
+  if (
+    (parsed.pathname && parsed.pathname !== '/') ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new ClientSafeError(
+      'Recovery origin must not contain paths, query strings, or fragments.',
+      400
+    );
+  }
+  if (!allowedOrigins.has(parsed.origin)) {
+    throw new ClientSafeError(
+      'Untrusted password recovery origin rejected.',
+      400
+    );
+  }
+
+  return parsed.origin;
+}
+
+export function getConfiguredLocalEmailWebhookUrl(): string | null {
+  const raw = (
+    process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL ||
+    process.env.PASSWORD_RESET_WEBHOOK_URL ||
+    ''
+  ).trim();
+  if (!raw || raw === 'MY_WEBHOOK_URL') return null;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+export interface LocalEmailDeliveryPayload {
+  to: string;
+  displayName: string;
+  resetUrl: string;
+  expiresInMinutes: number;
+}
+
+export type LocalEmailTransportFn = (
+  payload: LocalEmailDeliveryPayload
+) => Promise<void>;
+
+async function deliverLocalPasswordResetEmail(
+  payload: LocalEmailDeliveryPayload,
+  customTransport?: LocalEmailTransportFn
+): Promise<void> {
+  if (customTransport) {
+    await customTransport(payload);
+    return;
+  }
+  const webhookUrl = getConfiguredLocalEmailWebhookUrl();
+  if (!webhookUrl) {
+    throw new ClientSafeError(
+      'Local password recovery email delivery is not configured on this server. Set LOCAL_PASSWORD_RESET_WEBHOOK_URL in the environment to deliver local account recovery links.',
+      503
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        to: payload.to,
+        displayName: payload.displayName,
+        resetUrl: payload.resetUrl,
+        expiresInMinutes: payload.expiresInMinutes,
+      }),
+    });
+  } catch {
+    throw new ClientSafeError(
+      'Failed to reach configured local password recovery email service.',
+      502
+    );
+  }
+
+  if (!res.ok) {
+    throw new ClientSafeError(
+      'Configured local password recovery email service rejected the delivery request.',
+      502
+    );
+  }
+}
+
 /**
  * Dispatches a password-reset email using the configured Firebase Authentication project
- * (Identity Toolkit accounts:sendOobCode API) so no external custom webhook is required.
+ * (Identity Toolkit accounts:sendOobCode API).
  */
-export async function dispatchFirebasePasswordResetEmail(email: string): Promise<boolean> {
+export async function dispatchFirebasePasswordResetEmail(
+  email: string
+): Promise<boolean> {
   const apiKey = firebaseConfig?.apiKey?.trim();
   if (!apiKey) return false;
 
@@ -368,14 +612,90 @@ export async function dispatchFirebasePasswordResetEmail(email: string): Promise
   }
 }
 
+export interface FirebaseOobHandlerForTests {
+  verifyOnly: (oobCode: string) => Promise<{ email: string }>;
+  consume: (oobCode: string, newPassword: string) => Promise<{ email: string }>;
+}
+
+let customFirebaseOobHandlerForTests: FirebaseOobHandlerForTests | null = null;
+
+export function setFirebaseOobHandlerForTests(
+  handler: FirebaseOobHandlerForTests | null
+): void {
+  customFirebaseOobHandlerForTests = handler;
+}
+
 /**
- * Verifies and consumes a Firebase Authentication password-reset oobCode via Identity Toolkit
- * and returns the verified account email address.
+ * Phase 1: Verifies a Firebase Authentication password-reset oobCode with Identity Toolkit
+ * WITHOUT consuming it yet, so we can validate PostgreSQL account state before mutating Firebase.
  */
-async function verifyAndConsumeFirebaseOobCode(
+async function verifyFirebaseOobCodeWithoutConsuming(
+  oobCode: string
+): Promise<string> {
+  if (customFirebaseOobHandlerForTests) {
+    const res = await customFirebaseOobHandlerForTests.verifyOnly(oobCode);
+    return res.email.toLowerCase().trim();
+  }
+
+  const apiKey = firebaseConfig?.apiKey?.trim();
+  if (!apiKey) {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:resetPassword?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ oobCode }),
+      }
+    );
+  } catch {
+    throw new ClientSafeError(
+      'Failed to verify password recovery code with authentication provider.',
+      400
+    );
+  }
+
+  if (!res.ok) {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  const data = (await res.json()) as { email?: string; requestType?: string };
+  if (
+    !data?.email ||
+    typeof data.email !== 'string' ||
+    (data.requestType && data.requestType !== 'PASSWORD_RESET')
+  ) {
+    throw new ClientSafeError(
+      'Invalid, expired, or already used password recovery token.',
+      400
+    );
+  }
+
+  return data.email.toLowerCase().trim();
+}
+
+/**
+ * Phase 2: Consumes a verified Firebase Authentication password-reset oobCode and sets the new password.
+ */
+async function consumeFirebaseOobCode(
   oobCode: string,
   newPassword: string
 ): Promise<string> {
+  if (customFirebaseOobHandlerForTests) {
+    const res = await customFirebaseOobHandlerForTests.consume(oobCode, newPassword);
+    return res.email.toLowerCase().trim();
+  }
+
   const apiKey = firebaseConfig?.apiKey?.trim();
   if (!apiKey) {
     throw new ClientSafeError(
@@ -399,7 +719,7 @@ async function verifyAndConsumeFirebaseOobCode(
     );
   } catch {
     throw new ClientSafeError(
-      'Failed to verify password recovery code with authentication provider.',
+      'Failed to complete password reset with authentication provider.',
       400
     );
   }
@@ -411,7 +731,7 @@ async function verifyAndConsumeFirebaseOobCode(
     );
   }
 
-  const data = (await res.json()) as { email?: string; requestType?: string };
+  const data = (await res.json()) as { email?: string };
   if (!data?.email || typeof data.email !== 'string') {
     throw new ClientSafeError(
       'Invalid, expired, or already used password recovery token.',
@@ -423,18 +743,26 @@ async function verifyAndConsumeFirebaseOobCode(
 }
 
 /**
- * Initiates a password recovery flow using Firebase Authentication's supported password-reset
- * email delivery AND a single-use, short-lived (15-minute) SHA-256 hashed cryptographic token
- * stored in PostgreSQL (`password_reset_tokens`).
- * Invalidates prior unconsumed tokens for the account and returns an enumeration-safe response.
+ * Initiates a coherent password recovery flow tailored to the account's authentication provider:
+ * - `firebase` accounts: dispatches a single Firebase Auth reset email (`accounts:sendOobCode`) and creates NO unused DB token.
+ * - `local` accounts: requires a configured local email delivery mechanism (`LOCAL_PASSWORD_RESET_WEBHOOK_URL` or custom transport);
+ *   fails safely with 503 if unconfigured instead of pretending an email was sent; stores only a SHA-256 hash in `password_reset_tokens`.
+ * - `both` / `linked` accounts: uses configured local token delivery if available, or Firebase Auth reset email otherwise (never both).
  */
 export async function requestPasswordRecoveryToken(
   email: string,
-  options?: { returnTokenForTesting?: boolean; triggerFirebaseEmail?: boolean }
+  options?: {
+    origin?: string | null;
+    returnTokenForTesting?: boolean;
+    enforceDeliveryConfigInTest?: boolean;
+    triggerFirebaseEmail?: boolean;
+    localEmailTransport?: LocalEmailTransportFn;
+  }
 ): Promise<{
   accepted: true;
   message: string;
   expiresInMinutes: number;
+  deliveryChannel?: 'firebase' | 'local_token' | 'noop';
   _testRecoveryToken?: string;
 }> {
   try {
@@ -443,25 +771,110 @@ export async function requestPasswordRecoveryToken(
       throw new ClientSafeError('Please provide a valid email address.', 400);
     }
 
-    const shouldTriggerFirebase =
-      options?.triggerFirebaseEmail ?? process.env.NODE_ENV !== 'test';
+    // Always validate recovery origin up front so untrusted origins are rejected immediately
+    const trustedOrigin = validateTrustedRecoveryOrigin(options?.origin);
 
     const user = await findUserByEmail(normalizedEmail);
     if (!user) {
-      if (shouldTriggerFirebase) {
-        await dispatchFirebasePasswordResetEmail(normalizedEmail);
-      }
       return {
         accepted: true,
         message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
         expiresInMinutes: 15,
+        deliveryChannel: 'noop',
       };
     }
 
-    const { rawToken, tokenHash, expiresAt } = generateRecoveryToken();
     const now = new Date();
+    const hasLocalDelivery = Boolean(
+      getConfiguredLocalEmailWebhookUrl() || options?.localEmailTransport
+    );
+    const allowTestTokenWithoutTransport =
+      Boolean(options?.returnTokenForTesting) &&
+      process.env.NODE_ENV === 'test' &&
+      !options?.enforceDeliveryConfigInTest;
 
-    await db.transaction(async (tx) => {
+    // 1. Pure Firebase-authenticated account: use Firebase's supported reset flow ONLY (no unused PostgreSQL token)
+    if (user.authProvider === 'firebase' && !allowTestTokenWithoutTransport) {
+      // Invalidate any legacy unconsumed tokens if present
+      await db
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.userUid, user.uid),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        );
+
+      const shouldTriggerFirebase =
+        options?.triggerFirebaseEmail ?? process.env.NODE_ENV !== 'test';
+      if (shouldTriggerFirebase) {
+        const sent = await dispatchFirebasePasswordResetEmail(user.email);
+        if (!sent) {
+          throw new ClientSafeError(
+            'Password recovery service is temporarily unavailable. Please try again shortly.',
+            503
+          );
+        }
+      }
+
+      return {
+        accepted: true,
+        message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
+        expiresInMinutes: 15,
+        deliveryChannel: 'firebase',
+      };
+    }
+
+    // 2. Linked ('both' / 'linked') account when no local email webhook is configured:
+    // Use Firebase's supported reset flow (single email, zero unused DB tokens)
+    if (
+      (user.authProvider === 'both' || user.authProvider === 'linked') &&
+      !hasLocalDelivery &&
+      !allowTestTokenWithoutTransport
+    ) {
+      await db
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.userUid, user.uid),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        );
+
+      const shouldTriggerFirebase =
+        options?.triggerFirebaseEmail ?? process.env.NODE_ENV !== 'test';
+      if (shouldTriggerFirebase) {
+        const sent = await dispatchFirebasePasswordResetEmail(user.email);
+        if (!sent) {
+          throw new ClientSafeError(
+            'Password recovery service is temporarily unavailable. Please try again shortly.',
+            503
+          );
+        }
+      }
+
+      return {
+        accepted: true,
+        message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
+        expiresInMinutes: 15,
+        deliveryChannel: 'firebase',
+      };
+    }
+
+    // 3. Local-only account (or linked account with local email delivery configured):
+    // If local email delivery is NOT configured, do NOT pretend the message was sent!
+    if (!hasLocalDelivery && !allowTestTokenWithoutTransport) {
+      throw new ClientSafeError(
+        'Local password recovery email delivery is not configured on this server. Set LOCAL_PASSWORD_RESET_WEBHOOK_URL in the environment (or sign in with Google) to recover local accounts.',
+        503
+      );
+    }
+
+    const { rawToken, tokenHash, expiresAt } = generateRecoveryToken();
+
+    const insertedTokenId = await db.transaction(async (tx) => {
       // Invalidate any previous unconsumed recovery tokens for this user
       await tx
         .update(passwordResetTokens)
@@ -473,28 +886,55 @@ export async function requestPasswordRecoveryToken(
           )
         );
 
-      await tx.insert(passwordResetTokens).values({
-        userUid: user.uid,
-        tokenHash,
-        expiresAt,
-      });
+      const [inserted] = await tx
+        .insert(passwordResetTokens)
+        .values({
+          userUid: user.uid,
+          tokenHash,
+          expiresAt,
+        })
+        .returning({ id: passwordResetTokens.id });
+
+      return inserted.id;
     });
 
-    if (shouldTriggerFirebase) {
-      await dispatchFirebasePasswordResetEmail(user.email);
+    const resetUrl = `${trustedOrigin}/?mode=resetPassword&token=${encodeURIComponent(rawToken)}`;
+
+    if (hasLocalDelivery) {
+      try {
+        await deliverLocalPasswordResetEmail(
+          {
+            to: user.email,
+            displayName: user.displayName,
+            resetUrl,
+            expiresInMinutes: 15,
+          },
+          options?.localEmailTransport
+        );
+      } catch (deliveryErr) {
+        // Roll back / consume the undelivered token so no unused active token remains
+        await db
+          .update(passwordResetTokens)
+          .set({ consumedAt: new Date() })
+          .where(eq(passwordResetTokens.id, insertedTokenId));
+        throw deliveryErr;
+      }
     }
 
     const response: {
       accepted: true;
       message: string;
       expiresInMinutes: number;
+      deliveryChannel: 'local_token';
       _testRecoveryToken?: string;
     } = {
       accepted: true,
       message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
       expiresInMinutes: 15,
+      deliveryChannel: 'local_token',
     };
 
+    // Never return raw tokens in production API responses
     if (options?.returnTokenForTesting && process.env.NODE_ENV === 'test') {
       response._testRecoveryToken = rawToken;
     }
@@ -509,7 +949,8 @@ export async function requestPasswordRecoveryToken(
 
 /**
  * Verifies and atomically consumes a single-use password recovery token (or verified Firebase Auth oobCode),
- * updates the user's password hash, and increments tokenVersion to revoke prior sessions.
+ * updates the user's password hash, synchronizes linked credentials so stale local passwords cannot remain active,
+ * and increments tokenVersion + records revocation timestamp to invalidate all prior sessions.
  */
 export async function confirmPasswordRecoveryToken(
   rawToken: string,
@@ -616,24 +1057,63 @@ export async function confirmPasswordRecoveryToken(
         return updated;
       });
 
+      recordUserSessionRevocation(updatedUser.uid, now.getTime());
+
+      // If this account is linked to Firebase Auth, synchronize the password & revoke Firebase refresh tokens best-effort
+      if (!updatedUser.uid.startsWith('usr_')) {
+        try {
+          await adminAuth.updateUser(updatedUser.uid, { password: newPassword });
+        } catch {
+          // Ignore if local environment lacks Firebase Admin user-update IAM permission
+        }
+        try {
+          await adminAuth.revokeRefreshTokens(updatedUser.uid);
+        } catch {
+          // Ignore if local environment lacks Firebase Admin revocation IAM permission
+        }
+      }
+
       return sanitizeUserForClient(updatedUser);
     }
 
-    // Otherwise verify and consume as a Firebase Authentication oobCode
-    const verifiedEmail = await verifyAndConsumeFirebaseOobCode(
-      cleanedToken,
-      newPassword
-    );
+    // Otherwise handle as a Firebase Authentication oobCode using a safe 2-phase check:
+    // Phase 1: Verify the oobCode with Firebase WITHOUT consuming it yet
+    const verifiedEmail = await verifyFirebaseOobCodeWithoutConsuming(cleanedToken);
 
+    // Pre-check PostgreSQL account state BEFORE mutating Firebase credentials
+    const preCheckUsers = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, verifiedEmail));
+    const preCheckTarget = preCheckUsers[0];
+    if (
+      !preCheckTarget ||
+      preCheckTarget.accountStatus !== 'active' ||
+      preCheckTarget.deletedAt !== null
+    ) {
+      throw new ClientSafeError('Account is no longer active.', 400);
+    }
+
+    // Phase 2: Lock the PostgreSQL user row, consume the Firebase oobCode, and atomically update local passwordHash
+    // so that for linked ('both') or Firebase accounts, no old local password can ever remain active!
     const updatedFirebaseUser = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`SELECT uid FROM users WHERE uid = ${preCheckTarget.uid} FOR UPDATE`
+      );
+
       const userRows = await tx
         .select()
         .from(users)
-        .where(eq(users.email, verifiedEmail));
+        .where(eq(users.uid, preCheckTarget.uid));
       const targetUser = userRows[0];
 
       if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
         throw new ClientSafeError('Account is no longer active.', 400);
+      }
+
+      const consumedEmail = await consumeFirebaseOobCode(cleanedToken, newPassword);
+      if (consumedEmail !== verifiedEmail) {
+        throw new ClientSafeError('Password recovery email mismatch.', 400);
       }
 
       await tx
@@ -663,6 +1143,15 @@ export async function confirmPasswordRecoveryToken(
       return updated;
     });
 
+    recordUserSessionRevocation(updatedFirebaseUser.uid, now.getTime());
+    if (!updatedFirebaseUser.uid.startsWith('usr_')) {
+      try {
+        await adminAuth.revokeRefreshTokens(updatedFirebaseUser.uid);
+      } catch {
+        // Ignore if admin SDK lacks IAM permission in local environment
+      }
+    }
+
     return sanitizeUserForClient(updatedFirebaseUser);
   } catch (error) {
     if (error instanceof ClientSafeError) throw error;
@@ -673,7 +1162,7 @@ export async function confirmPasswordRecoveryToken(
 
 /**
  * Allows an authenticated user to change their existing password after verifying their current password.
- * Increments tokenVersion to invalidate older sessions.
+ * Increments tokenVersion and records a revocation timestamp to invalidate older sessions.
  */
 export async function changeAuthenticatedUserPassword(
   uid: string,
@@ -703,16 +1192,18 @@ export async function changeAuthenticatedUserPassword(
       throw new ClientSafeError('Current password is incorrect.', 401);
     }
 
+    const now = new Date();
     const [updated] = await db
       .update(users)
       .set({
         passwordHash: hashPassword(newPassword),
         tokenVersion: sql`${users.tokenVersion} + 1`,
-        updatedAt: new Date(),
+        updatedAt: now,
       })
       .where(eq(users.uid, uid))
       .returning();
 
+    recordUserSessionRevocation(uid, now.getTime());
     return updated;
   } catch (error) {
     if (error instanceof ClientSafeError) throw error;
@@ -746,17 +1237,19 @@ export async function linkPasswordToAuthenticatedAccount(
       );
     }
 
+    const now = new Date();
     const [updated] = await db
       .update(users)
       .set({
         passwordHash: hashPassword(newPassword),
         authProvider: 'both',
         tokenVersion: sql`${users.tokenVersion} + 1`,
-        updatedAt: new Date(),
+        updatedAt: now,
       })
       .where(eq(users.uid, uid))
       .returning();
 
+    recordUserSessionRevocation(uid, now.getTime());
     return updated;
   } catch (error) {
     if (error instanceof ClientSafeError) throw error;
@@ -766,16 +1259,28 @@ export async function linkPasswordToAuthenticatedAccount(
 }
 
 /**
- * Increments a user's tokenVersion to immediately revoke all existing local session tokens.
+ * Increments a user's tokenVersion, records a server-side revocation watermark,
+ * and revokes Firebase refresh tokens best-effort to immediately invalidate both local and Firebase sessions.
  */
 export async function revokeUserSessions(uid: string) {
+  const now = new Date();
   await db
     .update(users)
     .set({
       tokenVersion: sql`${users.tokenVersion} + 1`,
-      updatedAt: new Date(),
+      updatedAt: now,
     })
     .where(eq(users.uid, uid));
+
+  recordUserSessionRevocation(uid, now.getTime());
+
+  if (!uid.startsWith('usr_')) {
+    try {
+      await adminAuth.revokeRefreshTokens(uid);
+    } catch {
+      // Ignore if user does not exist in Firebase Auth or admin credentials are not configured for revocation
+    }
+  }
 }
 
 export async function updateUserProfile(
@@ -816,6 +1321,7 @@ export async function updateUserProfile(
  */
 export async function deleteUserAccount(uid: string) {
   try {
+    const now = new Date();
     await db.transaction(async (tx) => {
       const existing = await tx.select().from(users).where(eq(users.uid, uid));
       const user = existing[0];
@@ -828,7 +1334,7 @@ export async function deleteUserAccount(uid: string) {
         .values({
           uid,
           emailHash,
-          deletedAt: new Date(),
+          deletedAt: now,
         })
         .onConflictDoNothing();
 
@@ -842,6 +1348,8 @@ export async function deleteUserAccount(uid: string) {
       await tx.delete(examSessions).where(eq(examSessions.userUid, uid));
       await tx.delete(users).where(eq(users.uid, uid));
     });
+
+    recordUserSessionRevocation(uid, now.getTime());
 
     if (!uid.startsWith('usr_')) {
       try {
@@ -1646,6 +2154,14 @@ export async function toggleBookmarkForStudent(
       return { bookmarked: false, questionId };
     }
 
+    const qRows = await db
+      .select()
+      .from(questions)
+      .where(and(eq(questions.id, questionId), eq(questions.status, 'published')));
+    if (qRows.length === 0) {
+      throw new ClientSafeError('Question not found or not published.', 404);
+    }
+
     await db.insert(bookmarks).values({
       userUid,
       questionId,
@@ -1653,6 +2169,7 @@ export async function toggleBookmarkForStudent(
     });
     return { bookmarked: true, questionId };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error toggling bookmark:', error);
     throw new Error('Failed to update question bookmark.', { cause: error });
   }
@@ -1725,7 +2242,7 @@ export async function getStudentBookmarksAndReview(userUid: string) {
           explanationD: q.explanationD,
           difficulty: q.difficulty,
           tags: q.tags,
-          diagramSvg: q.diagramSvg,
+          diagramSvg: sanitizeSvgDiagram(q.diagramSvg),
           lastAttemptStatus: !latestAtt
             ? 'unanswered'
             : latestAtt.selectedOption === null
@@ -1762,7 +2279,7 @@ export async function getStudentBookmarksAndReview(userUid: string) {
           explanationD: q.explanationD,
           difficulty: q.difficulty,
           tags: q.tags,
-          diagramSvg: q.diagramSvg,
+          diagramSvg: sanitizeSvgDiagram(q.diagramSvg),
           isBookmarked: bookmarkedIds.has(q.id),
           status:
             latestAtt.selectedOption === null
@@ -2046,12 +2563,16 @@ export async function getAdminDashboardData() {
       })),
       questions: allQuestions.map((q) => ({
         ...q,
+        diagramSvg: sanitizeSvgDiagram(q.diagramSvg),
         subjectTitle: sMap.get(q.subjectId) || 'Unknown Subject',
         lectureTitle: lMap.get(q.lectureId) || 'Unknown Lecture',
       })),
       users: allUsers.map(({ passwordHash: _ph, ...u }) => ({
         ...u,
-        isOwner: isOwnerAdminEmail(u.email),
+        isOwner:
+          isOwnerAdminEmail(u.email) &&
+          u.authProvider !== 'local' &&
+          Boolean(u.emailVerified),
       })),
       recentActivity: recentSessions,
       recentImports,
@@ -2074,6 +2595,7 @@ export async function upsertSubjectAdmin(
   }
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     const slug = payload.title
       .toLowerCase()
       .trim()
@@ -2094,8 +2616,8 @@ export async function upsertSubjectAdmin(
         .returning();
 
       await logAdminAction(
-        admin.uid,
-        admin.email,
+        verifiedAdmin.uid,
+        verifiedAdmin.email,
         'UPDATE_SUBJECT',
         'subject',
         updated.id,
@@ -2116,8 +2638,8 @@ export async function upsertSubjectAdmin(
       .returning();
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'CREATE_SUBJECT',
       'subject',
       created.id,
@@ -2125,6 +2647,7 @@ export async function upsertSubjectAdmin(
     );
     return created;
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error saving subject:', error);
     throw new Error('Failed to save subject.', { cause: error });
   }
@@ -2144,6 +2667,7 @@ export async function upsertLectureAdmin(
   }
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     if (payload.id) {
       const [updated] = await db
         .update(lectures)
@@ -2161,8 +2685,8 @@ export async function upsertLectureAdmin(
         .returning();
 
       await logAdminAction(
-        admin.uid,
-        admin.email,
+        verifiedAdmin.uid,
+        verifiedAdmin.email,
         'UPDATE_LECTURE',
         'lecture',
         updated.id,
@@ -2199,8 +2723,8 @@ export async function upsertLectureAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'CREATE_LECTURE',
       'lecture',
       created.id,
@@ -2208,6 +2732,7 @@ export async function upsertLectureAdmin(
     );
     return created;
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error saving lecture:', error);
     throw new Error('Failed to save lecture.', { cause: error });
   }
@@ -2230,12 +2755,15 @@ export async function upsertQuestionAdmin(
     explanationB?: string;
     explanationC?: string;
     explanationD?: string;
+    diagramSvg?: string;
     difficulty: DifficultyLevel;
     tags?: string;
     status: ContentStatus;
   }
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
+    const sanitizedSvg = sanitizeSvgDiagram(payload.diagramSvg);
     const contentHash = computeContentHash(
       `${payload.subjectId}|${payload.lectureId}|${payload.questionText}|${payload.optionA}|${payload.optionB}|${payload.optionC}|${payload.optionD}`
     );
@@ -2263,6 +2791,7 @@ export async function upsertQuestionAdmin(
           explanationB: payload.explanationB?.trim() || '',
           explanationC: payload.explanationC?.trim() || '',
           explanationD: payload.explanationD?.trim() || '',
+          ...(payload.diagramSvg !== undefined ? { diagramSvg: sanitizedSvg } : {}),
           difficulty: payload.difficulty,
           tags: payload.tags?.trim() || '',
           status: payload.status,
@@ -2274,14 +2803,17 @@ export async function upsertQuestionAdmin(
         .returning();
 
       await logAdminAction(
-        admin.uid,
-        admin.email,
+        verifiedAdmin.uid,
+        verifiedAdmin.email,
         'UPDATE_QUESTION',
         'question',
         updated.id,
         `Updated question #${updated.id} to v${nextVersion} (historical attempt snapshots remain untouched)`
       );
-      return updated;
+      return {
+        ...updated,
+        diagramSvg: sanitizeSvgDiagram(updated.diagramSvg),
+      };
     }
 
     const [created] = await db
@@ -2300,6 +2832,7 @@ export async function upsertQuestionAdmin(
         explanationB: payload.explanationB?.trim() || '',
         explanationC: payload.explanationC?.trim() || '',
         explanationD: payload.explanationD?.trim() || '',
+        diagramSvg: sanitizedSvg,
         difficulty: payload.difficulty,
         tags: payload.tags?.trim() || '',
         status: payload.status || 'published',
@@ -2309,15 +2842,19 @@ export async function upsertQuestionAdmin(
       .returning();
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'CREATE_QUESTION',
       'question',
       created.id,
       `Created question #${created.id} (${created.difficulty})`
     );
-    return created;
+    return {
+      ...created,
+      diagramSvg: sanitizeSvgDiagram(created.diagramSvg),
+    };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error saving question:', error);
     throw new Error('Failed to save question.', { cause: error });
   }
@@ -2332,6 +2869,7 @@ export async function deleteSubjectAdmin(
   subjectId: number
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     const { title, qCount } = await db.transaction(async (tx) => {
       const existing = await tx
         .select()
@@ -2365,8 +2903,8 @@ export async function deleteSubjectAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_SUBJECT',
       'subject',
       subjectId,
@@ -2378,6 +2916,7 @@ export async function deleteSubjectAdmin(
       message: `Subject "${title}" and all associated lectures, quizzes, and questions were permanently deleted.`,
     };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting subject:', error);
     throw new Error('Failed to delete subject.', { cause: error });
   }
@@ -2392,6 +2931,7 @@ export async function deleteLectureAdmin(
   lectureId: number
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     const { title, qCount } = await db.transaction(async (tx) => {
       const existing = await tx
         .select()
@@ -2424,8 +2964,8 @@ export async function deleteLectureAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_LECTURE',
       'lecture',
       lectureId,
@@ -2437,6 +2977,7 @@ export async function deleteLectureAdmin(
       message: `Lecture "${title}" and all associated quizzes and questions were permanently deleted.`,
     };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting lecture:', error);
     throw new Error('Failed to delete lecture.', { cause: error });
   }
@@ -2450,6 +2991,7 @@ export async function deleteQuestionBankAdmin(
   bankId: number
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     const { title, qCount } = await db.transaction(async (tx) => {
       const existing = await tx
         .select()
@@ -2477,8 +3019,8 @@ export async function deleteQuestionBankAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_QUIZ_BANK',
       'question_bank',
       bankId,
@@ -2490,6 +3032,7 @@ export async function deleteQuestionBankAdmin(
       message: `Quiz "${title}" and its questions were permanently deleted.`,
     };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting quiz bank:', error);
     throw new Error('Failed to delete quiz bank.', { cause: error });
   }
@@ -2503,6 +3046,7 @@ export async function deleteOrArchiveQuestionAdmin(
   questionId: number
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     await db.transaction(async (tx) => {
       await tx.delete(bookmarks).where(eq(bookmarks.questionId, questionId));
       await tx
@@ -2512,8 +3056,8 @@ export async function deleteOrArchiveQuestionAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_QUESTION',
       'question',
       questionId,
@@ -2524,6 +3068,7 @@ export async function deleteOrArchiveQuestionAdmin(
       message: `Question #${questionId} was permanently deleted.`,
     };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting question:', error);
     throw new Error('Failed to delete question.', { cause: error });
   }
@@ -2537,6 +3082,7 @@ export async function deleteExamSessionAdmin(
   sessionId: number
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     await db.transaction(async (tx) => {
       await tx
         .delete(questionAttempts)
@@ -2545,8 +3091,8 @@ export async function deleteExamSessionAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_EXAM_SESSION',
       'exam_session',
       sessionId,
@@ -2558,6 +3104,7 @@ export async function deleteExamSessionAdmin(
       message: `Quiz session #${sessionId} was permanently deleted.`,
     };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting exam session:', error);
     throw new Error('Failed to delete quiz session.', { cause: error });
   }
@@ -2565,7 +3112,8 @@ export async function deleteExamSessionAdmin(
 
 /**
  * Changes a user's role between 'student' and 'admin' (one user at a time).
- * The primary owner account (zeyadzedan098@gmail.com) is protected and cannot be demoted.
+ * Requires an existing database-verified administrator and prevents demoting the
+ * verified primary owner account or the sole remaining administrator.
  */
 export async function updateUserRoleAdmin(
   admin: { uid: string; email: string },
@@ -2573,34 +3121,73 @@ export async function updateUserRoleAdmin(
   newRole: 'student' | 'admin'
 ) {
   try {
-    const existing = await db
-      .select()
-      .from(users)
-      .where(eq(users.uid, targetUid));
-    const targetUser = existing[0];
-    if (!targetUser) {
-      throw new ClientSafeError('User account not found.', 404);
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
+    if (newRole !== 'student' && newRole !== 'admin') {
+      throw new ClientSafeError('Invalid role specified.', 400);
     }
 
-    if (isOwnerAdminEmail(targetUser.email) && newRole !== 'admin') {
-      throw new ClientSafeError(
-        'The primary owner administrator account cannot be changed to student.',
-        403
-      );
-    }
+    const { targetUser, updated } = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(users)
+        .where(eq(users.uid, targetUid))
+        .for('update');
+      const found = existing[0];
+      if (!found || found.deletedAt !== null || found.accountStatus !== 'active') {
+        throw new ClientSafeError('User account not found or inactive.', 404);
+      }
 
-    const [updated] = await db
-      .update(users)
-      .set({
-        role: newRole,
-        updatedAt: new Date(),
-      })
-      .where(eq(users.uid, targetUid))
-      .returning();
+      const isVerifiedOwner =
+        isOwnerAdminEmail(found.email) &&
+        found.authProvider !== 'local' &&
+        Boolean(found.emailVerified);
+
+      if (isVerifiedOwner && newRole !== 'admin') {
+        throw new ClientSafeError(
+          'The primary owner administrator account cannot be changed to student.',
+          403
+        );
+      }
+
+      if (found.role === 'admin' && newRole !== 'admin') {
+        const activeAdmins = await tx
+          .select({ uid: users.uid })
+          .from(users)
+          .where(
+            and(
+              eq(users.role, 'admin'),
+              eq(users.accountStatus, 'active'),
+              isNull(users.deletedAt)
+            )
+          );
+        if (activeAdmins.length <= 1) {
+          throw new ClientSafeError(
+            'Cannot demote the last remaining active administrator account.',
+            409
+          );
+        }
+      }
+
+      const [updatedRow] = await tx
+        .update(users)
+        .set({
+          role: newRole,
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.uid, targetUid))
+        .returning();
+
+      return { targetUser: found, updated: updatedRow };
+    });
+
+    if (targetUser.role !== newRole && newRole === 'student') {
+      recordUserSessionRevocation(targetUid);
+    }
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'UPDATE_USER_ROLE',
       'user',
       targetUser.email,
@@ -2630,6 +3217,7 @@ export async function deleteUserAdmin(
   targetUid: string
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     const existing = await db
       .select()
       .from(users)
@@ -2639,7 +3227,12 @@ export async function deleteUserAdmin(
       throw new ClientSafeError('User account not found.', 404);
     }
 
-    if (isOwnerAdminEmail(targetUser.email)) {
+    const isVerifiedOwner =
+      isOwnerAdminEmail(targetUser.email) &&
+      targetUser.authProvider !== 'local' &&
+      Boolean(targetUser.emailVerified);
+
+    if (isVerifiedOwner) {
       throw new ClientSafeError(
         'The primary owner administrator account cannot be deleted.',
         403
@@ -2649,8 +3242,8 @@ export async function deleteUserAdmin(
     await deleteUserAccount(targetUid);
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'DELETE_USER',
       'user',
       targetUser.email,
@@ -2701,6 +3294,7 @@ export async function executeCsvImportAdmin(
   csvContent: string
 ) {
   try {
+    const verifiedAdmin = await assertActiveAdminInDb(admin.uid);
     await ensureSeededDatabase();
     const existingQuestions = await db.select().from(questions);
     const existingHashes = new Set(
@@ -2806,7 +3400,7 @@ export async function executeCsvImportAdmin(
       const [insertedBatch] = await tx
         .insert(importBatches)
         .values({
-          adminUid: admin.uid,
+          adminUid: verifiedAdmin.uid,
           fileName: fileName || 'questions_import.csv',
           fileHash: report.fileHash,
           totalRows: report.totalRows,
@@ -2825,8 +3419,8 @@ export async function executeCsvImportAdmin(
     });
 
     await logAdminAction(
-      admin.uid,
-      admin.email,
+      verifiedAdmin.uid,
+      verifiedAdmin.email,
       'BULK_CSV_IMPORT',
       'import_batch',
       batchRecord.id,

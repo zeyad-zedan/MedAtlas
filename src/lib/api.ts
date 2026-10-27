@@ -2,7 +2,6 @@ import {
   signInWithPopup,
   signOut,
   onAuthStateChanged,
-  sendPasswordResetEmail,
 } from 'firebase/auth';
 import { auth, googleAuthProvider } from './firebase.ts';
 
@@ -144,21 +143,16 @@ export const api = {
   },
 
   requestPasswordReset: async (email: string) => {
-    const res = await apiRequest<{
+    const origin =
+      typeof window !== 'undefined' ? window.location.origin : undefined;
+    return apiRequest<{
       accepted: boolean;
       message: string;
       expiresInMinutes: number;
     }>('/api/auth/forgot-password', {
       method: 'POST',
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, origin }),
     });
-    // Also trigger Firebase Auth password reset email best-effort if the user is registered in Firebase
-    try {
-      await sendPasswordResetEmail(auth, email.trim());
-    } catch {
-      // Enumeration-safe: ignore Firebase error if account is local-only or non-existent
-    }
-    return res;
   },
 
   confirmPasswordReset: (token: string, newPassword: string) =>

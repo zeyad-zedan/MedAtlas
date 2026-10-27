@@ -107,29 +107,512 @@ export function resolveDisplayedOption(
   return null;
 }
 
+const ALLOWED_SVG_TAGS: Record<string, string> = {
+  svg: 'svg',
+  g: 'g',
+  path: 'path',
+  circle: 'circle',
+  ellipse: 'ellipse',
+  rect: 'rect',
+  line: 'line',
+  polyline: 'polyline',
+  polygon: 'polygon',
+  text: 'text',
+  tspan: 'tspan',
+  defs: 'defs',
+  lineargradient: 'linearGradient',
+  radialgradient: 'radialGradient',
+  stop: 'stop',
+  marker: 'marker',
+  clippath: 'clipPath',
+  mask: 'mask',
+  pattern: 'pattern',
+  title: 'title',
+  desc: 'desc',
+};
+
+const ALLOWED_SVG_ATTRIBUTES: Record<string, string> = {
+  id: 'id',
+  class: 'class',
+  viewbox: 'viewBox',
+  preserveaspectratio: 'preserveAspectRatio',
+  width: 'width',
+  height: 'height',
+  x: 'x',
+  y: 'y',
+  x1: 'x1',
+  y1: 'y1',
+  x2: 'x2',
+  y2: 'y2',
+  cx: 'cx',
+  cy: 'cy',
+  r: 'r',
+  rx: 'rx',
+  ry: 'ry',
+  d: 'd',
+  points: 'points',
+  fill: 'fill',
+  'fill-opacity': 'fill-opacity',
+  'fill-rule': 'fill-rule',
+  stroke: 'stroke',
+  'stroke-width': 'stroke-width',
+  'stroke-dasharray': 'stroke-dasharray',
+  'stroke-dashoffset': 'stroke-dashoffset',
+  'stroke-linecap': 'stroke-linecap',
+  'stroke-linejoin': 'stroke-linejoin',
+  'stroke-miterlimit': 'stroke-miterlimit',
+  'stroke-opacity': 'stroke-opacity',
+  opacity: 'opacity',
+  transform: 'transform',
+  'text-anchor': 'text-anchor',
+  'dominant-baseline': 'dominant-baseline',
+  'alignment-baseline': 'alignment-baseline',
+  'font-family': 'font-family',
+  'font-size': 'font-size',
+  'font-weight': 'font-weight',
+  'font-style': 'font-style',
+  'letter-spacing': 'letter-spacing',
+  dx: 'dx',
+  dy: 'dy',
+  offset: 'offset',
+  'stop-color': 'stop-color',
+  'stop-opacity': 'stop-opacity',
+  gradientunits: 'gradientUnits',
+  gradienttransform: 'gradientTransform',
+  patternunits: 'patternUnits',
+  patterntransform: 'patternTransform',
+  clippathunits: 'clipPathUnits',
+  markerwidth: 'markerWidth',
+  markerheight: 'markerHeight',
+  markerunits: 'markerUnits',
+  refx: 'refX',
+  refy: 'refY',
+  orient: 'orient',
+  'marker-start': 'marker-start',
+  'marker-mid': 'marker-mid',
+  'marker-end': 'marker-end',
+  'clip-path': 'clip-path',
+  mask: 'mask',
+  'vector-effect': 'vector-effect',
+  style: 'style',
+  role: 'role',
+  'aria-label': 'aria-label',
+  'aria-hidden': 'aria-hidden',
+};
+
+const SAFE_SVG_STYLE_PROPERTIES = new Set([
+  'fill',
+  'fill-opacity',
+  'fill-rule',
+  'stroke',
+  'stroke-width',
+  'stroke-dasharray',
+  'stroke-dashoffset',
+  'stroke-linecap',
+  'stroke-linejoin',
+  'stroke-opacity',
+  'opacity',
+  'font-family',
+  'font-size',
+  'font-weight',
+  'font-style',
+  'text-anchor',
+  'dominant-baseline',
+  'letter-spacing',
+  'stop-color',
+  'stop-opacity',
+  'display',
+  'visibility',
+]);
+
+const NAMED_HTML_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  colon: ':',
+  tab: '\t',
+  newline: '\n',
+  nbsp: ' ',
+};
+
+function decodeHtmlEntities(input: string): string {
+  let current = input;
+  for (let pass = 0; pass < 3; pass++) {
+    const decoded = current
+      .replace(/&#x([0-9a-f]+);?/gi, (_m, hex) => {
+        const code = Number.parseInt(hex, 16);
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : '';
+      })
+      .replace(/&#([0-9]+);?/g, (_m, dec) => {
+        const code = Number.parseInt(dec, 10);
+        return Number.isFinite(code) && code > 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : '';
+      })
+      .replace(/&([a-z0-9]+);?/gi, (full, name) => {
+        const key = String(name).toLowerCase();
+        return key in NAMED_HTML_ENTITIES ? NAMED_HTML_ENTITIES[key] : full;
+      });
+    if (decoded === current) break;
+    current = decoded;
+  }
+  return current;
+}
+
+function escapeXmlText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeXmlAttr(value: string): string {
+  return escapeXmlText(value)
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function isSafeSvgAttributeValue(attrName: string, rawValue: string): string | null {
+  const decoded = decodeHtmlEntities(rawValue)
+    // Remove ASCII control chars and zero-width spaces that could obfuscate schemes
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\ufeff]/g, '')
+    .trim();
+
+  if (!decoded) return '';
+
+  if (attrName === 'style') {
+    const safeDecls: string[] = [];
+    const declarations = decoded.split(';');
+    for (const decl of declarations) {
+      const trimmedDecl = decl.trim();
+      if (!trimmedDecl) continue;
+      const colonIdx = trimmedDecl.indexOf(':');
+      if (colonIdx <= 0) continue;
+      const prop = trimmedDecl.slice(0, colonIdx).trim().toLowerCase();
+      const val = trimmedDecl.slice(colonIdx + 1).trim();
+      if (!SAFE_SVG_STYLE_PROPERTIES.has(prop)) continue;
+      const valLower = val.replace(/\s+/g, '').toLowerCase();
+      if (
+        valLower.includes('url(') ||
+        valLower.includes('expression') ||
+        valLower.includes('@import') ||
+        valLower.includes('javascript') ||
+        valLower.includes('vbscript') ||
+        valLower.includes('data:') ||
+        val.includes('\\') ||
+        val.includes(':') ||
+        val.includes('<') ||
+        val.includes('>') ||
+        !/^[#(),.%a-zA-Z0-9\s_-]+$/.test(val)
+      ) {
+        continue;
+      }
+      safeDecls.push(`${prop}: ${val}`);
+    }
+    return safeDecls.length > 0 ? safeDecls.join('; ') : null;
+  }
+
+  const compactLower = decoded.replace(/\s+/g, '').toLowerCase();
+
+  // Block any executable or external URI schemes, expressions, or embedded markup
+  if (
+    compactLower.includes('javascript:') ||
+    compactLower.includes('vbscript:') ||
+    compactLower.includes('data:') ||
+    compactLower.includes('file:') ||
+    compactLower.includes('http:') ||
+    compactLower.includes('https:') ||
+    compactLower.includes('//') ||
+    compactLower.includes('expression(') ||
+    compactLower.includes('@import') ||
+    compactLower.includes('-moz-binding') ||
+    compactLower.includes('behavior:') ||
+    decoded.includes('<') ||
+    decoded.includes('>')
+  ) {
+    return null;
+  }
+
+  // Only allow local fragment references like url(#gradientId) on attributes that reference defs
+  if (compactLower.includes('url(')) {
+    if (
+      attrName === 'fill' ||
+      attrName === 'stroke' ||
+      attrName === 'clip-path' ||
+      attrName === 'mask' ||
+      attrName === 'marker-start' ||
+      attrName === 'marker-mid' ||
+      attrName === 'marker-end'
+    ) {
+      if (!/^url\(\s*#[a-zA-Z0-9_-]+\s*\)$/.test(decoded)) {
+        return null;
+      }
+    } else {
+      return null;
+    }
+  }
+
+  return decoded;
+}
+
+interface ParsedSvgAttribute {
+  name: string;
+  value: string;
+}
+
+function parseTagAttributes(attrSource: string): ParsedSvgAttribute[] {
+  const attrs: ParsedSvgAttribute[] = [];
+  let i = 0;
+  const len = attrSource.length;
+
+  while (i < len) {
+    while (i < len && /[\s/]/.test(attrSource[i])) i++;
+    if (i >= len) break;
+
+    const nameStart = i;
+    while (i < len && !/[\s=/>"'`]/.test(attrSource[i])) i++;
+    const rawName = attrSource.slice(nameStart, i).trim().toLowerCase();
+    if (!rawName) {
+      i++;
+      continue;
+    }
+
+    while (i < len && /\s/.test(attrSource[i])) i++;
+
+    let rawValue = '';
+    if (i < len && attrSource[i] === '=') {
+      i++; // skip '='
+      while (i < len && /\s/.test(attrSource[i])) i++;
+      if (i < len) {
+        const quote = attrSource[i];
+        if (quote === '"' || quote === "'") {
+          i++;
+          const valStart = i;
+          while (i < len && attrSource[i] !== quote) i++;
+          rawValue = attrSource.slice(valStart, i);
+          if (i < len && attrSource[i] === quote) i++;
+        } else {
+          const valStart = i;
+          while (i < len && !/[\s/>]/.test(attrSource[i])) i++;
+          rawValue = attrSource.slice(valStart, i);
+        }
+      }
+    }
+
+    attrs.push({ name: rawName, value: rawValue });
+  }
+
+  return attrs;
+}
+
+interface SvgAstNode {
+  tag: string;
+  attrs: Array<{ name: string; value: string }>;
+  children: Array<SvgAstNode | string>;
+}
+
 /**
- * Sanitizes SVG markup before rendering to prevent stored XSS via <script>, <foreignObject>,
- * inline event handlers (onload, onerror, onclick, etc.), or javascript:/data:text/html URIs.
+ * Strict parser-based allowlist sanitizer for medical SVG diagrams.
+ * Parses XML/SVG markup into an explicit AST, strips all non-allowlisted elements (and their subtrees)
+ * such as <script>, <foreignObject>, <iframe>, <style>, <a>, <image>, <use>, and animation tags,
+ * strips all event handlers, decodes entities before validating attributes and CSS properties,
+ * and serializes canonical SVG markup.
  */
 export function sanitizeSvgDiagram(rawSvg: string | null | undefined): string {
   if (!rawSvg || typeof rawSvg !== 'string') return '';
   const trimmed = rawSvg.trim();
   if (!trimmed) return '';
 
-  const withoutDangerousTags = trimmed
-    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
-    .replace(/<script[^>]*\/?>/gi, '')
-    .replace(/<foreignObject[\s\S]*?>[\s\S]*?<\/foreignObject>/gi, '')
-    .replace(/<iframe[\s\S]*?>[\s\S]*?<\/iframe>/gi, '')
-    .replace(/<object[\s\S]*?>[\s\S]*?<\/object>/gi, '')
-    .replace(/<embed[^>]*\/?>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(
-      /\s(?:href|xlink:href|src)\s*=\s*(?:"\s*(?:javascript:|data:text\/html)[^"]*"|'\s*(?:javascript:|data:text\/html)[^']*')/gi,
-      ''
-    );
+  // Remove XML comments, CDATA, processing instructions, and DOCTYPE declarations before tokenizing
+  const cleanedSource = trimmed
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/gi, '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!DOCTYPE[\s\S]*?>/gi, '')
+    .replace(/<![a-zA-Z][\s\S]*?>/g, '');
 
-  return withoutDangerousTags;
+  const rootChildren: Array<SvgAstNode | string> = [];
+  const stack: SvgAstNode[] = [];
+  let ignoredDepth = 0;
+
+  let cursor = 0;
+  const totalLen = cleanedSource.length;
+
+  while (cursor < totalLen) {
+    const tagStart = cleanedSource.indexOf('<', cursor);
+    const textSliceEnd = tagStart === -1 ? totalLen : tagStart;
+    const textBefore = cleanedSource.slice(cursor, textSliceEnd);
+
+    if (ignoredDepth === 0 && stack.length > 0 && textBefore) {
+      const parentTag = stack[stack.length - 1].tag;
+      if (
+        parentTag === 'text' ||
+        parentTag === 'tspan' ||
+        parentTag === 'title' ||
+        parentTag === 'desc'
+      ) {
+        const cleanText = decodeHtmlEntities(textBefore);
+        if (cleanText) {
+          stack[stack.length - 1].children.push(cleanText);
+        }
+      }
+    }
+
+    if (tagStart === -1) break;
+
+    // Scan to closing '>' while respecting single and double quotes
+    let scan = tagStart + 1;
+    let activeQuote: string | null = null;
+    while (scan < totalLen) {
+      const ch = cleanedSource[scan];
+      if (activeQuote) {
+        if (ch === activeQuote) {
+          activeQuote = null;
+        }
+      } else {
+        if (ch === '"' || ch === "'") {
+          activeQuote = ch;
+        } else if (ch === '>') {
+          break;
+        }
+      }
+      scan++;
+    }
+
+    if (scan >= totalLen) {
+      // Unclosed '<' at end of input — drop it
+      break;
+    }
+
+    const insideTag = cleanedSource.slice(tagStart + 1, scan).trim();
+    cursor = scan + 1;
+
+    if (!insideTag) continue;
+
+    const isClosing = insideTag.startsWith('/');
+    const bodyAfterLeadingSlash = isClosing ? insideTag.slice(1).trim() : insideTag;
+    const isSelfClosing = !isClosing && bodyAfterLeadingSlash.endsWith('/');
+    const bodyCore = isSelfClosing
+      ? bodyAfterLeadingSlash.slice(0, -1).trim()
+      : bodyAfterLeadingSlash;
+
+    const nameMatch = /^([a-zA-Z0-9:_-]+)([\s\S]*)$/.exec(bodyCore);
+    if (!nameMatch) continue;
+
+    const rawTagName = nameMatch[1];
+    const rawAttrChunk = nameMatch[2] || '';
+    const lowerTagName = rawTagName.toLowerCase();
+
+    if (isClosing) {
+      if (ignoredDepth > 0) {
+        ignoredDepth--;
+        continue;
+      }
+      const canonicalClosing = ALLOWED_SVG_TAGS[lowerTagName];
+      if (!canonicalClosing) continue;
+      for (let s = stack.length - 1; s >= 0; s--) {
+        if (stack[s].tag === canonicalClosing) {
+          stack.length = s;
+          break;
+        }
+      }
+      continue;
+    }
+
+    if (ignoredDepth > 0) {
+      if (!isSelfClosing) {
+        ignoredDepth++;
+      }
+      continue;
+    }
+
+    const canonicalTag = ALLOWED_SVG_TAGS[lowerTagName];
+    if (!canonicalTag) {
+      // Disallowed element (e.g., script, foreignObject, iframe, style, a, image, animate):
+      // drop the element and ignore everything inside its subtree
+      if (!isSelfClosing) {
+        ignoredDepth = 1;
+      }
+      continue;
+    }
+
+    const parsedAttrs = parseTagAttributes(rawAttrChunk);
+    const safeAttrs: Array<{ name: string; value: string }> = [];
+    const seenAttrNames = new Set<string>();
+
+    if (canonicalTag === 'svg') {
+      safeAttrs.push({ name: 'xmlns', value: 'http://www.w3.org/2000/svg' });
+      seenAttrNames.add('xmlns');
+    }
+
+    for (const attr of parsedAttrs) {
+      const attrLower = attr.name.toLowerCase();
+      // Strictly reject all event handlers (on*) and namespace declarations/prefixes (xmlns:*, xlink:*)
+      if (attrLower.startsWith('on') || attrLower.includes(':')) {
+        continue;
+      }
+      if (attrLower === 'xmlns') {
+        continue;
+      }
+      const canonicalAttrName = ALLOWED_SVG_ATTRIBUTES[attrLower];
+      if (!canonicalAttrName || seenAttrNames.has(canonicalAttrName)) {
+        continue;
+      }
+      const validatedValue = isSafeSvgAttributeValue(attrLower, attr.value);
+      if (validatedValue === null) {
+        continue;
+      }
+      seenAttrNames.add(canonicalAttrName);
+      safeAttrs.push({ name: canonicalAttrName, value: validatedValue });
+    }
+
+    const node: SvgAstNode = {
+      tag: canonicalTag,
+      attrs: safeAttrs,
+      children: [],
+    };
+
+    if (stack.length > 0) {
+      stack[stack.length - 1].children.push(node);
+    } else if (canonicalTag === 'svg') {
+      rootChildren.push(node);
+    } else {
+      // Ignore top-level fragments that are not inside an <svg> root
+      continue;
+    }
+
+    if (!isSelfClosing) {
+      stack.push(node);
+    }
+  }
+
+  const firstSvg = rootChildren.find(
+    (child): child is SvgAstNode => typeof child !== 'string' && child.tag === 'svg'
+  );
+  if (!firstSvg) {
+    return '';
+  }
+
+  function serializeNode(node: SvgAstNode): string {
+    const attrStr = node.attrs
+      .map((a) => ` ${a.name}="${escapeXmlAttr(a.value)}"`)
+      .join('');
+    if (node.children.length === 0) {
+      return `<${node.tag}${attrStr}></${node.tag}>`;
+    }
+    const inner = node.children
+      .map((child) =>
+        typeof child === 'string' ? escapeXmlText(child) : serializeNode(child)
+      )
+      .join('');
+    return `<${node.tag}${attrStr}>${inner}</${node.tag}>`;
+  }
+
+  return serializeNode(firstSvg);
 }
 
 /**

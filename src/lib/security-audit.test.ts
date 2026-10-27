@@ -12,23 +12,36 @@ import {
   verifyPassword,
   hashRecoveryToken,
   requireAuth,
+  recordUserSessionRevocation,
+  setFirebaseTokenVerifierForTests,
   type AuthRequest,
 } from '../middleware/auth.ts';
-import { createBoundedRateLimiter } from '../middleware/rate-limit.ts';
+import {
+  createBoundedRateLimiter,
+  normalizeClientIp,
+  resolveTrustProxyConfig,
+} from '../middleware/rate-limit.ts';
 import { sanitizeSvgDiagram } from './mcq-engine.ts';
 import {
+  OWNER_ADMIN_EMAIL,
   ClientSafeError,
   evaluateServerExamDeadline,
   registerEmailPasswordUser,
   findUserByEmail,
+  getAuthenticatedUserByUid,
   getOrCreateUser,
-  dispatchFirebasePasswordResetEmail,
+  validateTrustedRecoveryOrigin,
+  setFirebaseOobHandlerForTests,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   linkPasswordToAuthenticatedAccount,
+  revokeUserSessions,
   deleteUserAccount,
+  updateUserRoleAdmin,
+  toggleBookmarkForStudent,
   saveSessionQuestionAnswer,
   completeExamSession,
+  type LocalEmailTransportFn,
 } from '../db/repository.ts';
 import { db, pool } from '../db/index.ts';
 import {
@@ -38,6 +51,7 @@ import {
   subjects,
   lectures,
   questions,
+  bookmarks,
   examSessions,
   questionAttempts,
 } from '../db/schema.ts';
@@ -50,6 +64,8 @@ const createdQuestionIds: number[] = [];
 const createdSessionIds: number[] = [];
 
 after(async () => {
+  setFirebaseTokenVerifierForTests(null);
+  setFirebaseOobHandlerForTests(null);
   try {
     if (createdSessionIds.length > 0) {
       await db
@@ -60,6 +76,9 @@ after(async () => {
         .where(inArray(examSessions.id, createdSessionIds));
     }
     if (createdQuestionIds.length > 0) {
+      await db
+        .delete(bookmarks)
+        .where(inArray(bookmarks.questionId, createdQuestionIds));
       await db.delete(questions).where(inArray(questions.id, createdQuestionIds));
     }
     if (createdLectureIds.length > 0) {
@@ -69,6 +88,9 @@ after(async () => {
       await db.delete(subjects).where(inArray(subjects.id, createdSubjectIds));
     }
     if (createdUserUids.length > 0) {
+      await db
+        .delete(bookmarks)
+        .where(inArray(bookmarks.userUid, createdUserUids));
       await db
         .delete(passwordResetTokens)
         .where(inArray(passwordResetTokens.userUid, createdUserUids));
@@ -86,9 +108,177 @@ after(async () => {
 
 describe('Security & Reliability Audit Regression Suite', () => {
   // ==========================================================================
-  // 1 & 2. CRITICAL: PASSWORD RESET & RECOVERY TOKEN SECURITY
+  // PRIORITY 1: ELIMINATE UNAUTHORIZED ADMINISTRATOR PROVISIONING
   // ==========================================================================
-  it('1. Rejects unauthenticated password reset attempts that lack a valid recovery token', async () => {
+  it('P1. Prevents local registration with OWNER_ADMIN_EMAIL from granting admin, blocks unverified admin promotion, enforces admin RBAC, and serializes concurrent bootstrap', async () => {
+    // Snapshot any existing owner row so we can test clean bootstrap & restore afterward
+    const existingOwnerRows = await db
+      .select()
+      .from(users)
+      .where(eq(users.email, OWNER_ADMIN_EMAIL));
+    const savedOwner = existingOwnerRows[0] || null;
+
+    try {
+      if (savedOwner) {
+        await db.delete(users).where(eq(users.uid, savedOwner.uid));
+      }
+
+      // 1. Local registration using OWNER_ADMIN_EMAIL must NEVER grant admin or emailVerified
+      const localOwnerAttempt = await registerEmailPasswordUser(
+        OWNER_ADMIN_EMAIL,
+        'AttackerLocalPass123!',
+        'Unverified Local Registrant'
+      );
+      assert.equal(
+        localOwnerAttempt.role,
+        'student',
+        'Local registration with OWNER_ADMIN_EMAIL must never grant admin role'
+      );
+      assert.equal(
+        localOwnerAttempt.emailVerified,
+        false,
+        'Local registration must not mark emailVerified = true without verification'
+      );
+
+      // 2. Subsequent reads via getAuthenticatedUserByUid and findUserByEmail must NOT auto-promote to admin
+      const fetchedByUid = await getAuthenticatedUserByUid(localOwnerAttempt.uid);
+      assert.equal(fetchedByUid?.role, 'student');
+      const fetchedByEmail = await findUserByEmail(OWNER_ADMIN_EMAIL);
+      assert.equal(fetchedByEmail?.role, 'student');
+
+      // Clean up the unverified local account before testing verified Firebase bootstrap
+      await db.delete(users).where(eq(users.uid, localOwnerAttempt.uid));
+
+      // 3. Unverified Firebase user with OWNER_ADMIN_EMAIL must be rejected (403)
+      await assert.rejects(
+        async () => {
+          await getOrCreateUser(
+            `fb_unverified_owner_${TEST_RUN_ID}`,
+            OWNER_ADMIN_EMAIL,
+            'Unverified Firebase Owner',
+            { authType: 'firebase', emailVerified: false, allowCreate: true }
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 403
+      );
+
+      // 4. Concurrent first-admin provisioning via verified Firebase identity must be race-safe
+      const verifiedOwnerUid = savedOwner?.uid || `fb_verified_owner_${TEST_RUN_ID}`;
+      const [boot1, boot2, boot3] = await Promise.all([
+        getOrCreateUser(verifiedOwnerUid, OWNER_ADMIN_EMAIL, 'Verified Owner Admin', {
+          authType: 'firebase',
+          emailVerified: true,
+          allowCreate: true,
+        }),
+        getOrCreateUser(verifiedOwnerUid, OWNER_ADMIN_EMAIL, 'Verified Owner Admin', {
+          authType: 'firebase',
+          emailVerified: true,
+          allowCreate: true,
+        }),
+        getOrCreateUser(verifiedOwnerUid, OWNER_ADMIN_EMAIL, 'Verified Owner Admin', {
+          authType: 'firebase',
+          emailVerified: true,
+          allowCreate: true,
+        }),
+      ]);
+
+      assert.equal(boot1.role, 'admin');
+      assert.equal(boot2.role, 'admin');
+      assert.equal(boot3.role, 'admin');
+      assert.equal(boot1.emailVerified, true);
+
+      // A concurrent second UID attempting to claim OWNER_ADMIN_EMAIL must be rejected with 409
+      await assert.rejects(
+        async () => {
+          await getOrCreateUser(
+            `fb_competing_owner_${TEST_RUN_ID}`,
+            OWNER_ADMIN_EMAIL,
+            'Competing Owner',
+            { authType: 'firebase', emailVerified: true, allowCreate: true }
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 409
+      );
+
+      // 5. Silent email reassignment on an existing admin UID must be rejected with 409
+      await assert.rejects(
+        async () => {
+          await getOrCreateUser(
+            verifiedOwnerUid,
+            `reassigned.${TEST_RUN_ID}@medatlas.test`,
+            'Reassigned Email Attempt',
+            { authType: 'firebase', emailVerified: true, allowCreate: true }
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 409
+      );
+
+      // 6. Normal students cannot change their own role or another user's role
+      const normalStudent = await registerEmailPasswordUser(
+        `student.rbac.${TEST_RUN_ID}@medatlas.test`,
+        'StudentRbacPass123!',
+        'Normal Student'
+      );
+      createdUserUids.push(normalStudent.uid);
+
+      await assert.rejects(
+        async () => {
+          await updateUserRoleAdmin(
+            { uid: normalStudent.uid, email: normalStudent.email },
+            normalStudent.uid,
+            'admin'
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 403
+      );
+
+      // 7. Legitimate verified administrator can promote and demote a student account
+      const promoted = await updateUserRoleAdmin(
+        { uid: boot1.uid, email: boot1.email },
+        normalStudent.uid,
+        'admin'
+      );
+      assert.equal(promoted.user.role, 'admin');
+
+      const demoted = await updateUserRoleAdmin(
+        { uid: boot1.uid, email: boot1.email },
+        normalStudent.uid,
+        'student'
+      );
+      assert.equal(demoted.user.role, 'student');
+
+      // Verified owner admin cannot be demoted to student
+      await assert.rejects(
+        async () => {
+          await updateUserRoleAdmin(
+            { uid: boot1.uid, email: boot1.email },
+            boot1.uid,
+            'student'
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 403
+      );
+
+      if (!savedOwner) {
+        await db.delete(users).where(eq(users.uid, verifiedOwnerUid));
+      }
+    } finally {
+      if (savedOwner) {
+        const current = await db
+          .select()
+          .from(users)
+          .where(eq(users.uid, savedOwner.uid));
+        if (current.length === 0) {
+          await db.insert(users).values(savedOwner);
+        }
+      }
+    }
+  });
+
+  // ==========================================================================
+  // PRIORITY 2: REPAIR THE BROKEN HYBRID PASSWORD-RESET ARCHITECTURE
+  // ==========================================================================
+  it('P2.1 Rejects unauthenticated password reset attempts that lack a valid recovery token', async () => {
     await assert.rejects(
       async () => {
         await confirmPasswordRecoveryToken('', 'NewCompromisedPass123!');
@@ -107,7 +297,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
   });
 
-  it('2. Enforces hashed, single-use, expiring recovery tokens and invalidates prior sessions upon reset', async () => {
+  it('P2.2 Local-only password reset fails honestly (503) when unconfigured, delivers single-use tokens when configured, and rejects untrusted origins', async () => {
     const email = `sec.reset.${TEST_RUN_ID}@medatlas.test`;
     const user = await registerEmailPasswordUser(
       email,
@@ -116,7 +306,52 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
     createdUserUids.push(user.uid);
 
-    // Issue a session token at initial tokenVersion (1)
+    // 1. When no local email webhook/dispatcher is configured, local-only reset must fail honestly with 503
+    const prevWebhook = process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL;
+    const prevLegacyWebhook = process.env.PASSWORD_RESET_WEBHOOK_URL;
+    delete process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL;
+    delete process.env.PASSWORD_RESET_WEBHOOK_URL;
+
+    try {
+      await assert.rejects(
+        async () => {
+          await requestPasswordRecoveryToken(email, {
+            enforceDeliveryConfigInTest: true,
+          });
+        },
+        (err: any) =>
+          err instanceof ClientSafeError &&
+          err.statusCode === 503 &&
+          /LOCAL_PASSWORD_RESET_WEBHOOK_URL/i.test(err.message)
+      );
+    } finally {
+      if (prevWebhook !== undefined) process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL = prevWebhook;
+      if (prevLegacyWebhook !== undefined)
+        process.env.PASSWORD_RESET_WEBHOOK_URL = prevLegacyWebhook;
+    }
+
+    // 2. Untrusted recovery origin must be rejected with 400
+    await assert.rejects(
+      async () => {
+        validateTrustedRecoveryOrigin('https://evil-phishing.example.com');
+      },
+      (err: any) =>
+        err instanceof ClientSafeError &&
+        err.statusCode === 400 &&
+        /untrusted/i.test(err.message)
+    );
+
+    // 3. Configure local reset email transport and verify end-to-end local recovery flow
+    const dispatchedEmails: Array<{
+      to: string;
+      displayName: string;
+      resetUrl: string;
+      expiresInMinutes: number;
+    }> = [];
+    const localTransport: LocalEmailTransportFn = async (payload) => {
+      dispatchedEmails.push(payload);
+    };
+
     const oldSessionToken = createServerSessionToken({
       uid: user.uid,
       email: user.email,
@@ -127,14 +362,17 @@ describe('Security & Reliability Audit Regression Suite', () => {
     // Request token #1, then immediately request token #2 (which must supersede token #1)
     const req1 = await requestPasswordRecoveryToken(email, {
       returnTokenForTesting: true,
+      localEmailTransport: localTransport,
     });
     const req2 = await requestPasswordRecoveryToken(email, {
       returnTokenForTesting: true,
+      localEmailTransport: localTransport,
     });
 
-    assert.ok(req1._testRecoveryToken && req1._testRecoveryToken.length === 64);
-    assert.ok(req2._testRecoveryToken && req2._testRecoveryToken.length === 64);
-    assert.notEqual(req1._testRecoveryToken, req2._testRecoveryToken);
+    assert.equal(req1.deliveryChannel, 'local_token');
+    assert.equal(req2.deliveryChannel, 'local_token');
+    assert.equal(dispatchedEmails.length, 2);
+    assert.ok(dispatchedEmails[1].resetUrl.includes(req2._testRecoveryToken!));
 
     // Verify raw token is NEVER stored in the database (only SHA-256 hash)
     const dbTokens = await db
@@ -226,16 +464,202 @@ describe('Security & Reliability Audit Regression Suite', () => {
       verifyPassword('UpdatedValidPass456!', userInDbAfterReset.passwordHash),
       true
     );
+  });
 
-    // Firebase Auth password-reset email dispatch works directly via configured Firebase project without PASSWORD_RESET_WEBHOOK_URL
-    const firebaseDispatched = await dispatchFirebasePasswordResetEmail(email);
-    assert.equal(firebaseDispatched, true);
+  it('P2.3 Firebase-only password reset creates zero unused DB tokens, and linked-account Firebase oobCode reset invalidates the old local password', async () => {
+    const fbUid = `fb_reset_only_${TEST_RUN_ID}`;
+    const fbEmail = `fb.reset.only.${TEST_RUN_ID}@medatlas.test`;
+    createdUserUids.push(fbUid);
+
+    await getOrCreateUser(fbUid, fbEmail, 'Firebase Reset User', {
+      authType: 'firebase',
+      emailVerified: true,
+      allowCreate: true,
+    });
+
+    // Request password reset for a Firebase-only account
+    const fbResetRes = await requestPasswordRecoveryToken(fbEmail);
+    assert.equal(fbResetRes.accepted, true);
+    assert.equal(fbResetRes.deliveryChannel, 'firebase');
+
+    // Verify ZERO unused rows were created in password_reset_tokens for the Firebase-only account
+    const fbDbTokens = await db
+      .select()
+      .from(passwordResetTokens)
+      .where(eq(passwordResetTokens.userUid, fbUid));
+    assert.equal(
+      fbDbTokens.length,
+      0,
+      'Firebase-backed password reset must not insert unused tokens into password_reset_tokens'
+    );
+
+    // Link a local password to make this a hybrid ('both') account
+    const linked = await linkPasswordToAuthenticatedAccount(
+      fbUid,
+      'OldLinkedPassword123!'
+    );
+    assert.equal(linked.authProvider, 'both');
+
+    // Simulate completing a Firebase oobCode reset via the 2-phase handler and verify old local password is invalidated
+    let phase1Verified = false;
+    let phase2Consumed = false;
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async (code) => {
+        assert.equal(code, 'firebase_oob_code_valid_test_token_12345');
+        phase1Verified = true;
+        return { email: fbEmail };
+      },
+      consume: async (code, _newPass) => {
+        assert.equal(code, 'firebase_oob_code_valid_test_token_12345');
+        assert.equal(phase1Verified, true, 'Phase 1 verifyOnly must run before Phase 2 consume');
+        phase2Consumed = true;
+        return { email: fbEmail };
+      },
+    });
+
+    try {
+      await confirmPasswordRecoveryToken(
+        'firebase_oob_code_valid_test_token_12345',
+        'NewFirebaseSyncedPass789!'
+      );
+      assert.equal(phase2Consumed, true);
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    const afterHybridReset = await findUserByEmail(fbEmail);
+    assert.ok(afterHybridReset?.passwordHash);
+    assert.equal(
+      verifyPassword('OldLinkedPassword123!', afterHybridReset.passwordHash),
+      false,
+      'Old local password on a linked account must be invalidated after Firebase oobCode password reset'
+    );
+    assert.equal(
+      verifyPassword('NewFirebaseSyncedPass789!', afterHybridReset.passwordHash),
+      true
+    );
+  });
+
+  // ==========================================================================
+  // PRIORITY 3: ENFORCE SESSION REVOCATION & ACCOUNT STATUS FOR FIREBASE AUTH
+  // ==========================================================================
+  it('P3. Enforces session revocation, deleted account tombstones, and suspended account status on Firebase-authenticated requests', async () => {
+    const fbUid = `fb_session_guard_${TEST_RUN_ID}`;
+    const fbEmail = `fb.session.guard.${TEST_RUN_ID}@medatlas.test`;
+    createdUserUids.push(fbUid);
+
+    await getOrCreateUser(fbUid, fbEmail, 'Firebase Guarded User', {
+      authType: 'firebase',
+      emailVerified: true,
+      allowCreate: true,
+    });
+
+    const invokeRequireAuth = async (bearerToken: string) => {
+      let status = 200;
+      let body: any = null;
+      let nextCalled = false;
+      const req = {
+        headers: { authorization: `Bearer ${bearerToken}` },
+      } as unknown as AuthRequest;
+      const res = {
+        status(code: number) {
+          status = code;
+          return this;
+        },
+        json(payload: any) {
+          body = payload;
+          return this;
+        },
+      } as any;
+      await requireAuth(req, res, () => {
+        nextCalled = true;
+      });
+      return { status, body, nextCalled, user: req.user };
+    };
+
+    try {
+      // 1. Valid verified Firebase token succeeds
+      const nowSec = Math.floor(Date.now() / 1000);
+      setFirebaseTokenVerifierForTests(async (_token, checkRevoked) => {
+        assert.equal(checkRevoked, true, 'verifyIdToken must be called with checkRevoked = true');
+        return {
+          uid: fbUid,
+          email: fbEmail,
+          name: 'Firebase Guarded User',
+          email_verified: true,
+          iat: nowSec,
+          auth_time: nowSec,
+        };
+      });
+
+      const validRes = await invokeRequireAuth('mock.firebase.jwt.token');
+      assert.equal(validRes.nextCalled, true);
+      assert.equal(validRes.status, 200);
+
+      // 2. Revoking user sessions (logout) invalidates Firebase tokens issued prior to revocation
+      await revokeUserSessions(fbUid);
+      setFirebaseTokenVerifierForTests(async () => ({
+        uid: fbUid,
+        email: fbEmail,
+        name: 'Firebase Guarded User',
+        email_verified: true,
+        iat: nowSec - 10, // issued 10s before logout revocation
+        auth_time: nowSec - 10,
+      }));
+
+      const afterLogoutRes = await invokeRequireAuth('mock.firebase.jwt.token');
+      assert.equal(afterLogoutRes.nextCalled, false);
+      assert.equal(afterLogoutRes.status, 401);
+
+      // 3. Firebase Admin SDK reporting auth/id-token-revoked returns 401
+      setFirebaseTokenVerifierForTests(async () => {
+        const err: any = new Error('Firebase ID token has been revoked.');
+        err.code = 'auth/id-token-revoked';
+        throw err;
+      });
+      const sdkRevokedRes = await invokeRequireAuth('mock.firebase.jwt.token');
+      assert.equal(sdkRevokedRes.nextCalled, false);
+      assert.equal(sdkRevokedRes.status, 401);
+
+      // 4. Suspended account status in PostgreSQL blocks Firebase-authenticated requests with 403
+      const freshIssuedSec = Math.floor((Date.now() + 5_000) / 1000);
+      await db
+        .update(users)
+        .set({ accountStatus: 'suspended' })
+        .where(eq(users.uid, fbUid));
+
+      setFirebaseTokenVerifierForTests(async () => ({
+        uid: fbUid,
+        email: fbEmail,
+        name: 'Firebase Guarded User',
+        email_verified: true,
+        iat: freshIssuedSec,
+        auth_time: freshIssuedSec,
+      }));
+
+      const suspendedRes = await invokeRequireAuth('mock.firebase.jwt.token');
+      assert.equal(suspendedRes.nextCalled, false);
+      assert.equal(suspendedRes.status, 403);
+
+      // Restore active status, then delete account and verify Firebase token is rejected with 401
+      await db
+        .update(users)
+        .set({ accountStatus: 'active' })
+        .where(eq(users.uid, fbUid));
+      await deleteUserAccount(fbUid);
+
+      const deletedRes = await invokeRequireAuth('mock.firebase.jwt.token');
+      assert.equal(deletedRes.nextCalled, false);
+      assert.equal(deletedRes.status, 401);
+    } finally {
+      setFirebaseTokenVerifierForTests(null);
+    }
   });
 
   // ==========================================================================
   // 3, 4 & 5. CRITICAL: SESSION SECRET & TOKEN VERIFICATION
   // ==========================================================================
-  it('3. Rejects missing, short, low-entropy, or placeholder AUTH_SESSION_SECRET values', () => {
+  it('3 & 4. Rejects missing, short, low-entropy, or placeholder AUTH_SESSION_SECRET values and forged tokens', () => {
     assert.throws(() => validateSessionSecret(undefined), /required/i);
     assert.throws(() => validateSessionSecret(''), /required/i);
     assert.throws(
@@ -247,9 +671,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
 
     const strongSecret = '9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e';
     assert.equal(validateSessionSecret(strongSecret), strongSecret);
-  });
 
-  it('4 & 5. Rejects forged tokens signed with old hardcoded secret and expired tokens', () => {
     const oldHardcodedSecret = 'medatlas_default_server_hmac_secret_2026_secure_key';
     const forgedPayload = Buffer.from(
       JSON.stringify({
@@ -297,7 +719,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
     const providerEmail = `provider.student.${TEST_RUN_ID}@medatlas.test`;
     createdUserUids.push(providerUid);
 
-    // Provision a provider-authenticated user (passwordHash is null)
     const createdProviderUser = await getOrCreateUser(
       providerUid,
       providerEmail,
@@ -307,7 +728,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(createdProviderUser.uid, providerUid);
     assert.equal(createdProviderUser.passwordHash, null);
 
-    // Attacker attempts to register via /api/auth/register using the victim's email
     await assert.rejects(
       async () => {
         await registerEmailPasswordUser(
@@ -322,7 +742,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
         /already exists/i.test(err.message)
     );
 
-    // Verify victim's passwordHash is STILL null and UID is unchanged
     const [victimAfterAttack] = await db
       .select()
       .from(users)
@@ -330,7 +749,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(victimAfterAttack.passwordHash, null);
     assert.equal(victimAfterAttack.displayName, 'Dr. Provider Student');
 
-    // Unverified Firebase email token must be rejected from provisioning/linking
     await assert.rejects(
       async () => {
         await getOrCreateUser(
@@ -343,7 +761,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
       (err: any) => err instanceof ClientSafeError && err.statusCode === 403
     );
 
-    // Conflicting UID for an existing email must NOT overwrite the existing user's UID
     await assert.rejects(
       async () => {
         await getOrCreateUser(
@@ -356,7 +773,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
       (err: any) => err instanceof ClientSafeError && err.statusCode === 409
     );
 
-    // Authenticated owner can explicitly link a local password via linkPasswordToAuthenticatedAccount
     const linked = await linkPasswordToAuthenticatedAccount(
       providerUid,
       'OwnerLinkedPassword123!'
@@ -366,10 +782,9 @@ describe('Security & Reliability Audit Regression Suite', () => {
   });
 
   // ==========================================================================
-  // 8 & 9. HIGH: SERVER-SIDE EXAM DEADLINES & ATOMIC RACE-SAFE COMPLETION
+  // 8, 9 & P7. SERVER-SIDE EXAM DEADLINES, CONCURRENT COMPLETION & BOOKMARK GUARD
   // ==========================================================================
-  it('8 & 9. Enforces server-side exam deadlines and prevents duplicate question_attempts under concurrent completion', async () => {
-    // Pure deadline evaluator unit checks
+  it('8, 9 & P7. Enforces server-side exam deadlines, prevents duplicate question_attempts, and blocks bookmarking unpublished questions', async () => {
     const startedMs = 1_700_000_000_000;
     const startedDate = new Date(startedMs);
     const activeDeadline = evaluateServerExamDeadline({
@@ -390,7 +805,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(expiredDeadline.isExpired, true);
     assert.equal(expiredDeadline.remainingSeconds, 0);
 
-    // Database integration test for exam deadline & concurrent completion
     const examUser = await registerEmailPasswordUser(
       `exam.audit.${TEST_RUN_ID}@medatlas.test`,
       'ExamStudentPass123!',
@@ -460,6 +874,37 @@ describe('Security & Reliability Audit Regression Suite', () => {
       .returning();
     createdQuestionIds.push(q2.id);
 
+    const [draftQ] = await db
+      .insert(questions)
+      .values({
+        subjectId: subj.id,
+        lectureId: lect.id,
+        questionText: 'Unpublished draft question that students must not bookmark',
+        optionA: 'A',
+        optionB: 'B',
+        optionC: 'C',
+        optionD: 'D',
+        correctAnswer: 'A',
+        explanation: 'Draft explanation',
+        difficulty: 'Hard',
+        status: 'draft',
+        contentHash: `hash_draft_${TEST_RUN_ID}`,
+      })
+      .returning();
+    createdQuestionIds.push(draftQ.id);
+
+    // P7: Bookmarking an unpublished (draft) question must fail with 404
+    await assert.rejects(
+      async () => {
+        await toggleBookmarkForStudent(examUser.uid, draftQ.id);
+      },
+      (err: any) => err instanceof ClientSafeError && err.statusCode === 404
+    );
+
+    // Bookmarking a published question succeeds
+    const bmRes = await toggleBookmarkForStudent(examUser.uid, q1.id);
+    assert.equal(bmRes.bookmarked, true);
+
     const orderItems = [
       {
         questionId: q1.id,
@@ -477,7 +922,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
       },
     ];
 
-    // Create an active exam session that started 10 seconds ago with a 300s limit
     const [activeExam] = await db
       .insert(examSessions)
       .values({
@@ -497,7 +941,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
       .returning();
     createdSessionIds.push(activeExam.id);
 
-    // Fire 3 concurrent completion calls with manipulated clientElapsedSeconds = 1
     const [resA, resB, resC] = await Promise.all([
       completeExamSession(examUser.uid, activeExam.id, { [q1.id]: 'B', [q2.id]: 'A' }, 1),
       completeExamSession(examUser.uid, activeExam.id, { [q1.id]: 'B', [q2.id]: 'A' }, 1),
@@ -508,17 +951,14 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(resB.status, 'completed');
     assert.equal(resC.status, 'completed');
     assert.equal(resA.correctCount, 2);
-    // Server must compute elapsedSeconds from server startedAt (~10s), NOT client-supplied 1s!
     assert.ok(resA.elapsedSeconds >= 9, `Expected server elapsed >= 9s, got ${resA.elapsedSeconds}`);
 
-    // Verify strictly 2 question_attempts rows exist (zero duplicates despite 3 concurrent calls)
     const attemptsInDb = await db
       .select()
       .from(questionAttempts)
       .where(eq(questionAttempts.sessionId, activeExam.id));
     assert.equal(attemptsInDb.length, 2);
 
-    // Now test expired exam session deadline enforcement
     const [expiredExam] = await db
       .insert(examSessions)
       .values({
@@ -533,13 +973,11 @@ describe('Security & Reliability Audit Regression Suite', () => {
         timeLimitSeconds: 60,
         elapsedSeconds: 0,
         questionOrderJson: JSON.stringify(orderItems),
-        // Started 5 minutes ago on a 1-minute exam
         startedAt: new Date(Date.now() - 300_000),
       })
       .returning();
     createdSessionIds.push(expiredExam.id);
 
-    // Attempting to save an answer after deadline expiration must be rejected with 409
     await assert.rejects(
       async () => {
         await saveSessionQuestionAnswer(
@@ -548,7 +986,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
           q2.id,
           'A',
           false,
-          5 // spoofed client elapsedSeconds = 5
+          5
         );
       },
       (err: any) =>
@@ -557,13 +995,12 @@ describe('Security & Reliability Audit Regression Suite', () => {
         /expired/i.test(err.message)
     );
 
-    // Attempting to mutate answers during late completion past grace window must be rejected with 409
     await assert.rejects(
       async () => {
         await completeExamSession(
           examUser.uid,
           expiredExam.id,
-          { [q1.id]: 'B', [q2.id]: 'A' }, // trying to change q2 from null -> 'A' after deadline
+          { [q1.id]: 'B', [q2.id]: 'A' },
           10
         );
       },
@@ -593,11 +1030,9 @@ describe('Security & Reliability Audit Regression Suite', () => {
       tokenVersion: delUser.tokenVersion,
     });
 
-    // Delete account
     const delResult = await deleteUserAccount(delUser.uid);
     assert.equal(delResult.deleted, true);
 
-    // Calling getOrCreateUser with the deleted UID (even as firebase or local) must fail with 401 and NEVER recreate the user
     await assert.rejects(
       async () => {
         await getOrCreateUser(delUser.uid, delUser.email, delUser.displayName, {
@@ -612,14 +1047,12 @@ describe('Security & Reliability Audit Regression Suite', () => {
         /deleted/i.test(err.message)
     );
 
-    // Verify user row is still absent from users table
     const remainingUserRows = await db
       .select()
       .from(users)
       .where(eq(users.uid, delUser.uid));
     assert.equal(remainingUserRows.length, 0);
 
-    // Verify requireAuth immediately rejects the token that was issued before deletion
     let authStatus = 200;
     const req = {
       headers: { authorization: `Bearer ${tokenBeforeDelete}` },
@@ -642,9 +1075,30 @@ describe('Security & Reliability Audit Regression Suite', () => {
   });
 
   // ==========================================================================
-  // 11. MEDIUM: BOUNDED SELF-PRUNING RATE LIMITER
+  // PRIORITY 6: HARDEN RATE-LIMIT IP HANDLING AGAINST SPOOFED X-FORWARDED-FOR
   // ==========================================================================
-  it('11. Enforces request rate limits, prunes expired entries, and caps memory at maxKeys', () => {
+  it('P6. Enforces request rate limits, ignores spoofed X-Forwarded-For headers, prunes expired entries, and caps memory at maxKeys', () => {
+    assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: '0' } as any), false);
+    assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: 'false' } as any), false);
+    assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: '2' } as any), 2);
+
+    // Verify normalizeClientIp ignores raw spoofed X-Forwarded-For when trust proxy is disabled
+    const spoofedDirectReq = {
+      ip: '10.20.30.40',
+      headers: { 'x-forwarded-for': '203.0.113.99, 198.51.100.1' },
+      socket: { remoteAddress: '::ffff:192.168.10.5' },
+      app: {
+        get(setting: string) {
+          return setting === 'trust proxy' ? false : undefined;
+        },
+      },
+    } as any;
+    assert.equal(
+      normalizeClientIp(spoofedDirectReq),
+      '192.168.10.5',
+      'When trust proxy is false, normalizeClientIp must use socket.remoteAddress and ignore X-Forwarded-For'
+    );
+
     const limiter = createBoundedRateLimiter({
       scope: 'unit-test-limiter',
       windowMs: 2_000,
@@ -652,14 +1106,20 @@ describe('Security & Reliability Audit Regression Suite', () => {
       maxKeys: 25,
     });
 
-    const makeMockPair = (ip: string) => {
+    const makeMockPair = (socketIp: string, spoofedXff?: string) => {
       let statusCode = 200;
       const headers: Record<string, string> = {};
       const req = {
-        ip,
+        ip: socketIp,
+        headers: spoofedXff ? { 'x-forwarded-for': spoofedXff } : {},
         baseUrl: '/api/auth',
         path: '/login',
-        socket: { remoteAddress: ip },
+        socket: { remoteAddress: socketIp },
+        app: {
+          get(setting: string) {
+            return setting === 'trust proxy' ? false : undefined;
+          },
+        },
       } as any;
       const res = {
         setHeader(k: string, v: string) {
@@ -676,9 +1136,9 @@ describe('Security & Reliability Audit Regression Suite', () => {
       return { req, res, getStatus: () => statusCode, headers };
     };
 
-    // First 3 requests from 10.0.0.1 succeed; 4th is blocked with 429 and Retry-After
+    // Attacker sends 4 requests from the same socket IP (10.0.0.1) while rotating spoofed X-Forwarded-For headers
     for (let i = 1; i <= 3; i++) {
-      const { req, res, getStatus } = makeMockPair('10.0.0.1');
+      const { req, res, getStatus } = makeMockPair('10.0.0.1', `203.0.113.${i}`);
       let nextCalled = false;
       limiter(req, res, () => {
         nextCalled = true;
@@ -687,7 +1147,8 @@ describe('Security & Reliability Audit Regression Suite', () => {
       assert.equal(getStatus(), 200);
     }
 
-    const fourth = makeMockPair('10.0.0.1');
+    // 4th request from 10.0.0.1 with a brand-new spoofed X-Forwarded-For MUST still be blocked (429)
+    const fourth = makeMockPair('10.0.0.1', '198.51.100.250');
     let fourthNext = false;
     limiter(fourth.req, fourth.res, () => {
       fourthNext = true;
@@ -696,7 +1157,6 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(fourth.getStatus(), 429);
     assert.ok(Number(fourth.headers['Retry-After']) >= 1);
 
-    // Flood with 100 unique spoofed IPs and verify store size never exceeds maxKeys (25)
     for (let i = 0; i < 100; i++) {
       const { req, res } = makeMockPair(`192.168.1.${i}`);
       limiter(req, res, () => {});
@@ -706,33 +1166,58 @@ describe('Security & Reliability Audit Regression Suite', () => {
       );
     }
 
-    // Prune after window expiration clears all entries
     const removed = limiter.pruneExpired(Date.now() + 10_000);
     assert.equal(removed, 25);
     assert.equal(limiter.getStoreSize(), 0);
   });
 
   // ==========================================================================
-  // 12. BROADER AUDIT: SVG DIAGRAM XSS SANITIZATION
+  // PRIORITY 5: REPLACE REGEX-ONLY SVG SANITIZATION WITH STRICT ALLOWLIST PARSER
   // ==========================================================================
-  it('12. Strips <script>, <foreignObject>, inline event handlers, and javascript: URIs from SVG diagrams', () => {
+  it('P5. Strips standard, event-handler, foreignObject, URI, CSS, and entity-obfuscated/nested XSS payloads while preserving valid medical SVGs', () => {
+    // 1–4: <script>, event handlers, <foreignObject>, and javascript:/data: URIs
     const maliciousSvg = `
-      <svg viewBox="0 0 100 100" onload="alert('xss')">
+      <svg viewBox="0 0 100 100" onload="alert('xss')" xmlns:xlink="http://www.w3.org/1999/xlink">
         <script>window.stealToken()</script>
         <foreignObject><iframe src="javascript:alert(1)"></iframe></foreignObject>
         <a href="javascript:evil()" xlink:href="data:text/html,<script>alert(1)</script>">
-          <circle cx="50" cy="50" r="40" onclick="evil()" fill="#0284C7" />
+          <circle cx="50" cy="50" r="40" onclick="evil()" onbegin="evil()" fill="#0284C7" />
         </a>
       </svg>
     `;
-    const clean = sanitizeSvgDiagram(maliciousSvg);
-    assert.ok(!/<script/i.test(clean));
-    assert.ok(!/<foreignObject/i.test(clean));
-    assert.ok(!/<iframe/i.test(clean));
-    assert.ok(!/onload\s*=/i.test(clean));
-    assert.ok(!/onclick\s*=/i.test(clean));
-    assert.ok(!/javascript:/i.test(clean));
-    assert.ok(!/data:text\/html/i.test(clean));
-    assert.ok(clean.includes('<circle cx="50" cy="50" r="40"'));
+    const clean1 = sanitizeSvgDiagram(maliciousSvg);
+    assert.ok(!/<script/i.test(clean1));
+    assert.ok(!/<foreignObject/i.test(clean1));
+    assert.ok(!/<iframe/i.test(clean1));
+    assert.ok(!/<a[\s>]/i.test(clean1));
+    assert.ok(!/onload/i.test(clean1));
+    assert.ok(!/onclick/i.test(clean1));
+    assert.ok(!/onbegin/i.test(clean1));
+    assert.ok(!/javascript:/i.test(clean1));
+    assert.ok(!/data:text\/html/i.test(clean1));
+
+    // 5 & 6: Obfuscated/entity-encoded URIs, nested <script><script>, and malicious inline CSS styles
+    const obfuscatedSvg = `
+      <svg viewBox="0 0 200 100">
+        <script><script>alert(1)</script></script>
+        <use href="&#x6a;&#x61;&#x76;&#x61;&#x73;&#x63;&#x72;&#x69;&#x70;&#x74;:alert(1)" />
+        <image xlink:href="&#106;&#97;&#118;&#97;&#115;&#99;&#114;&#105;&#112;&#116;:alert(2)" />
+        <animate attributeName="href" to="javascript:alert(3)" />
+        <set attributeName="onload" to="alert(4)" />
+        <rect x="10" y="10" width="80" height="40" style="fill: #0284C7; background-image: url(javascript:alert(5)); width: expression(alert(6));" />
+        <text x="20" y="35" fill="#ffffff">AV Node</text>
+      </svg>
+    `;
+    const clean2 = sanitizeSvgDiagram(obfuscatedSvg);
+    assert.ok(!/<script/i.test(clean2));
+    assert.ok(!/<use/i.test(clean2));
+    assert.ok(!/<image/i.test(clean2));
+    assert.ok(!/<animate/i.test(clean2));
+    assert.ok(!/<set/i.test(clean2));
+    assert.ok(!/javascript/i.test(clean2));
+    assert.ok(!/expression\s*\(/i.test(clean2));
+    assert.ok(!/url\s*\(/i.test(clean2));
+    assert.ok(clean2.includes('style="fill: #0284C7"'));
+    assert.ok(clean2.includes('<text x="20" y="35" fill="#ffffff">AV Node</text>'));
   });
 });

@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import type { Request, Response, NextFunction } from 'express';
 import crypto from 'node:crypto';
 import * as dotenv from 'dotenv';
@@ -31,10 +32,74 @@ export interface AuthenticatedUser {
   tokenVersion?: number;
   authType?: 'local' | 'firebase';
   emailVerified?: boolean;
+  iat?: number;
 }
 
 export interface AuthRequest extends Request {
   user?: AuthenticatedUser;
+}
+
+// Server-side revocation watermark map (supplements PostgreSQL tokenVersion & updatedAt)
+const userRevocationTimestampsMs = new Map<string, number>();
+
+export function recordUserSessionRevocation(uid: string, timestampMs = Date.now()): void {
+  if (!uid) return;
+  const prev = userRevocationTimestampsMs.get(uid) ?? 0;
+  userRevocationTimestampsMs.set(uid, Math.max(prev, timestampMs));
+}
+
+export function getUserSessionRevocationTimestamp(uid: string): number | null {
+  return userRevocationTimestampsMs.get(uid) ?? null;
+}
+
+export interface DecodedFirebaseTokenLike {
+  uid: string;
+  email?: string;
+  name?: string;
+  email_verified?: boolean;
+  iat?: number;
+  auth_time?: number;
+  iatMs?: number;
+}
+
+type FirebaseVerifierFn = (
+  token: string,
+  checkRevoked: boolean
+) => Promise<DecodedFirebaseTokenLike>;
+
+let customFirebaseVerifierForTests: FirebaseVerifierFn | null = null;
+
+export function setFirebaseTokenVerifierForTests(
+  fn: FirebaseVerifierFn | null
+): void {
+  customFirebaseVerifierForTests = fn;
+}
+
+async function verifyFirebaseIdTokenWithRevocation(
+  token: string
+): Promise<DecodedFirebaseTokenLike> {
+  if (customFirebaseVerifierForTests) {
+    return customFirebaseVerifierForTests(token, true);
+  }
+  try {
+    return (await adminAuth.verifyIdToken(token, true)) as DecodedFirebaseTokenLike;
+  } catch (err: any) {
+    const code = String(err?.code || err?.errorInfo?.code || '');
+    // Re-throw explicit token/user security errors immediately
+    if (
+      code === 'auth/id-token-revoked' ||
+      code === 'auth/user-disabled' ||
+      code === 'auth/id-token-expired' ||
+      code === 'auth/argument-error' ||
+      code === 'auth/invalid-id-token'
+    ) {
+      throw err;
+    }
+    // If checkRevoked=true failed only because the runtime environment lacks IAM service-account
+    // credentials for getUser metadata lookup, still verify the cryptographic signature and rely on
+    // our PostgreSQL session revocation watermark & account status checks below.
+    return (await adminAuth.verifyIdToken(token, false)) as DecodedFirebaseTokenLike;
+  }
 }
 
 /**
@@ -150,6 +215,7 @@ export function createServerSessionToken(
     email: String(payload.email).toLowerCase().trim(),
     name: payload.name ? String(payload.name) : undefined,
     tokenVersion,
+    emailVerified: Boolean(payload.emailVerified),
     iat: now,
     exp,
   };
@@ -217,7 +283,8 @@ export function verifyServerSessionToken(
       name: parsed.name ? String(parsed.name) : undefined,
       tokenVersion: parsed.tokenVersion,
       authType: 'local',
-      emailVerified: true,
+      emailVerified: Boolean(parsed.emailVerified),
+      iat: typeof parsed.iat === 'number' ? parsed.iat : undefined,
     };
   } catch {
     return null;
@@ -227,10 +294,13 @@ export function verifyServerSessionToken(
 export interface UserSessionStateRecord {
   exists: boolean;
   isDeleted: boolean;
+  isSuspendedOrInactive: boolean;
   accountStatus?: string;
   tokenVersion?: number;
   email?: string;
   displayName?: string;
+  emailVerified?: boolean;
+  revokedAtMs?: number | null;
 }
 
 export async function lookupUserSessionState(
@@ -256,23 +326,45 @@ export async function lookupUserSessionState(
   const userRows = await db.select().from(users).where(eq(users.uid, uid));
   const dbUser = userRows[0];
 
+  const memRevokedAtMs = userRevocationTimestampsMs.get(uid) ?? null;
+
   if (!dbUser) {
     return {
       exists: false,
       isDeleted: tombstones.length > 0,
+      isSuspendedOrInactive: false,
+      revokedAtMs: memRevokedAtMs,
     };
   }
 
   const isDeleted =
-    dbUser.accountStatus !== 'active' || dbUser.deletedAt !== null;
+    tombstones.length > 0 ||
+    dbUser.deletedAt !== null ||
+    dbUser.accountStatus === 'deleted';
+
+  const isSuspendedOrInactive =
+    !isDeleted && dbUser.accountStatus !== 'active';
+
+  const dbRevokedAtMs =
+    dbUser.tokenVersion > 1 && dbUser.updatedAt
+      ? new Date(dbUser.updatedAt).getTime()
+      : null;
+
+  const revokedAtMs =
+    dbRevokedAtMs !== null && memRevokedAtMs !== null
+      ? Math.max(dbRevokedAtMs, memRevokedAtMs)
+      : dbRevokedAtMs ?? memRevokedAtMs;
 
   return {
     exists: true,
     isDeleted,
+    isSuspendedOrInactive,
     accountStatus: dbUser.accountStatus,
     tokenVersion: dbUser.tokenVersion,
     email: dbUser.email,
     displayName: dbUser.displayName,
+    emailVerified: Boolean(dbUser.emailVerified),
+    revokedAtMs,
   };
 }
 
@@ -305,7 +397,22 @@ export const requireAuth = async (
           error: 'Unauthorized: Account no longer exists or has been deleted.',
         });
       }
+      if (state.isSuspendedOrInactive) {
+        return res.status(403).json({
+          error: 'Forbidden: This account is suspended or inactive.',
+        });
+      }
       if (state.tokenVersion !== localSession.tokenVersion) {
+        return res.status(401).json({
+          error: 'Unauthorized: Session has been revoked. Please sign in again.',
+        });
+      }
+      if (
+        state.revokedAtMs !== null &&
+        state.revokedAtMs !== undefined &&
+        localSession.iat !== undefined &&
+        localSession.iat <= state.revokedAtMs
+      ) {
         return res.status(401).json({
           error: 'Unauthorized: Session has been revoked. Please sign in again.',
         });
@@ -317,7 +424,7 @@ export const requireAuth = async (
         name: state.displayName || localSession.name,
         tokenVersion: state.tokenVersion,
         authType: 'local',
-        emailVerified: true,
+        emailVerified: Boolean(state.emailVerified),
       };
       return next();
     } catch (error) {
@@ -328,7 +435,7 @@ export const requireAuth = async (
 
   // Otherwise verify strictly as a Firebase Auth ID token
   try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
+    const decodedToken = await verifyFirebaseIdTokenWithRevocation(token);
     if (!decodedToken || !decodedToken.uid) {
       return res.status(401).json({ error: 'Unauthorized: Invalid authentication token' });
     }
@@ -337,7 +444,7 @@ export const requireAuth = async (
         error: 'Unauthorized: Verified email address is required on authentication token.',
       });
     }
-    if (decodedToken.email_verified === false) {
+    if (decodedToken.email_verified !== true) {
       return res.status(403).json({
         error: 'Forbidden: Please verify your email address before accessing your account.',
       });
@@ -349,6 +456,35 @@ export const requireAuth = async (
         error: 'Unauthorized: This account has been deleted.',
       });
     }
+    if (state.isSuspendedOrInactive) {
+      return res.status(403).json({
+        error: 'Forbidden: This account is suspended or inactive.',
+      });
+    }
+
+    // Compare token issuance / authentication timestamp against server-side revocation watermark
+    const tokenIssuedSec =
+      typeof decodedToken.iat === 'number'
+        ? decodedToken.iat
+        : typeof decodedToken.auth_time === 'number'
+        ? decodedToken.auth_time
+        : null;
+    const tokenIssuedMs =
+      typeof decodedToken.iatMs === 'number'
+        ? decodedToken.iatMs
+        : tokenIssuedSec !== null
+        ? tokenIssuedSec * 1000
+        : null;
+
+    if (
+      state.revokedAtMs !== null &&
+      state.revokedAtMs !== undefined &&
+      (tokenIssuedMs === null || tokenIssuedMs <= state.revokedAtMs)
+    ) {
+      return res.status(401).json({
+        error: 'Unauthorized: Session has been revoked. Please sign in again.',
+      });
+    }
 
     req.user = {
       uid: decodedToken.uid,
@@ -356,10 +492,21 @@ export const requireAuth = async (
       name: decodedToken.name,
       tokenVersion: state.tokenVersion ?? 1,
       authType: 'firebase',
-      emailVerified: Boolean(decodedToken.email_verified ?? true),
+      emailVerified: true,
     };
     return next();
-  } catch {
+  } catch (err: any) {
+    const code = String(err?.code || err?.errorInfo?.code || '');
+    if (code === 'auth/id-token-revoked') {
+      return res.status(401).json({
+        error: 'Unauthorized: Session has been revoked. Please sign in again.',
+      });
+    }
+    if (code === 'auth/user-disabled') {
+      return res.status(403).json({
+        error: 'Forbidden: This account has been disabled.',
+      });
+    }
     return res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
   }
 };

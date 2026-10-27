@@ -1,6 +1,6 @@
+import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'node:path';
-import * as dotenv from 'dotenv';
 import {
   requireAuth,
   type AuthRequest,
@@ -11,6 +11,7 @@ import {
 import {
   createBoundedRateLimiter,
   normalizeClientIp,
+  resolveTrustProxyConfig,
 } from './src/middleware/rate-limit.ts';
 import {
   ClientSafeError,
@@ -51,13 +52,11 @@ import {
 } from './src/db/repository.ts';
 import { getSampleCsvTemplate } from './src/lib/mcq-engine.ts';
 
-dotenv.config({ override: true });
-
 // Validate AUTH_SESSION_SECRET at module load / startup (fails fast if missing or weak)
 validateAuthConfiguration();
 
 export const app = express();
-app.set('trust proxy', 1);
+app.set('trust proxy', resolveTrustProxyConfig());
 app.disable('x-powered-by');
 
 // Security headers middleware
@@ -136,7 +135,7 @@ function sendErrorResponse(
   return res.status(defaultStatus).json({ error: fallbackMessage });
 }
 
-// Middleware to verify database-backed Administrator role without creating or resurrecting users
+// Middleware to verify database-backed Administrator role without creating unverified admins
 const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
@@ -151,7 +150,12 @@ const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction)
           })
         : await getAuthenticatedUserByUid(req.user.uid);
 
-    if (!dbUser || dbUser.role !== 'admin') {
+    if (
+      !dbUser ||
+      dbUser.deletedAt !== null ||
+      dbUser.accountStatus !== 'active' ||
+      dbUser.role !== 'admin'
+    ) {
       return res
         .status(403)
         .json({ error: 'Forbidden: Administrator privileges are required.' });
@@ -200,12 +204,14 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
       });
     }
 
+    // Any client-supplied role or emailVerified flags in req.body are ignored.
     const user = await registerEmailPasswordUser(email, password, displayName);
     const token = createServerSessionToken({
       uid: user.uid,
       email: user.email,
       name: user.displayName,
       tokenVersion: user.tokenVersion,
+      emailVerified: Boolean(user.emailVerified),
     });
 
     return res.status(201).json({
@@ -228,12 +234,16 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
     if (!user || !user.passwordHash || !verifyPassword(String(password), user.passwordHash)) {
       return res.status(401).json({ error: 'Invalid email address or password.' });
     }
+    if (user.accountStatus !== 'active') {
+      return res.status(403).json({ error: 'This account is suspended or inactive.' });
+    }
 
     const token = createServerSessionToken({
       uid: user.uid,
       email: user.email,
       name: user.displayName,
       tokenVersion: user.tokenVersion,
+      emailVerified: Boolean(user.emailVerified),
     });
 
     return res.json({
@@ -246,18 +256,23 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 });
 
 /**
- * Step 1 of Password Recovery: Request a single-use cryptographic recovery token.
- * Enumeration-safe: returns the same generic response whether or not the email exists.
+ * Step 1 of Password Recovery: Request an account-aware password reset email / token.
  */
 app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
   try {
-    const { email } = req.body || {};
+    const { email, origin } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res
         .status(400)
         .json({ error: 'Please enter a valid account email address.' });
     }
-    const result = await requestPasswordRecoveryToken(email);
+    const candidateOrigin =
+      typeof origin === 'string' && origin.trim().length > 0
+        ? origin.trim()
+        : undefined;
+    const result = await requestPasswordRecoveryToken(email, {
+      origin: candidateOrigin,
+    });
     return res.json({
       accepted: result.accepted,
       message: result.message,
@@ -330,6 +345,7 @@ app.post(
         email: updated.email,
         name: updated.displayName,
         tokenVersion: updated.tokenVersion,
+        emailVerified: Boolean(updated.emailVerified),
       });
       return res.json({
         message: 'Your password has been updated.',
@@ -361,6 +377,7 @@ app.post(
         email: updated.email,
         name: updated.displayName,
         tokenVersion: updated.tokenVersion,
+        emailVerified: Boolean(updated.emailVerified),
       });
       return res.json({
         message: 'Local password has been linked to your account.',
@@ -644,6 +661,7 @@ app.post('/api/admin/questions', requireAuth, requireAdmin, async (req: AuthRequ
       explanationB,
       explanationC,
       explanationD,
+      diagramSvg,
       difficulty,
       tags,
       status,
@@ -683,6 +701,7 @@ app.post('/api/admin/questions', requireAuth, requireAdmin, async (req: AuthRequ
         explanationB: explanationB ? String(explanationB) : '',
         explanationC: explanationC ? String(explanationC) : '',
         explanationD: explanationD ? String(explanationD) : '',
+        diagramSvg: diagramSvg !== undefined ? String(diagramSvg) : undefined,
         difficulty: difficulty || 'Medium',
         tags: tags ? String(tags) : '',
         status: status || 'published',
@@ -898,6 +917,13 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
+    // Prevent serving the compiled backend bundle (dist/server.js) as a public static asset
+    app.use((req, res, next) => {
+      if (req.path === '/server.js' || req.path.startsWith('/server.js.')) {
+        return res.status(404).end();
+      }
+      return next();
+    });
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));

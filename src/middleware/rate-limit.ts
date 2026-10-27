@@ -10,6 +10,7 @@ export interface RateLimiterOptions {
   maxRequests: number;
   maxKeys?: number;
   scope?: string;
+  trustProxy?: boolean | number;
   keyGenerator?: (req: Request) => string;
   message?: string;
 }
@@ -21,9 +22,72 @@ export interface BoundedRateLimiterMiddleware {
   clear: () => void;
 }
 
-export function normalizeClientIp(req: Pick<Request, 'ip' | 'socket'>): string {
-  const raw = req.ip || req.socket?.remoteAddress || 'unknown';
-  return String(raw).trim().toLowerCase().slice(0, 128) || 'unknown';
+/**
+ * Resolves a safe Express `trust proxy` configuration.
+ * Never returns unconditional `true` (which would trust arbitrary client-supplied X-Forwarded-For chains).
+ * Defaults to 1 hop on Cloud Run / production reverse proxy deployments and false when direct,
+ * or honors explicit TRUST_PROXY_HOPS ('0'/'false' -> false, positive integer -> hop count).
+ */
+export function resolveTrustProxyConfig(
+  rawEnvOrMap:
+    | string
+    | Record<string, string | undefined>
+    | undefined = process.env.TRUST_PROXY_HOPS ?? process.env.TRUST_PROXY,
+  nodeEnv: string | undefined = process.env.NODE_ENV,
+  isCloudRun: boolean = Boolean(process.env.K_SERVICE)
+): boolean | number {
+  const rawEnvValue =
+    typeof rawEnvOrMap === 'object' && rawEnvOrMap !== null
+      ? rawEnvOrMap.TRUST_PROXY_HOPS ?? rawEnvOrMap.TRUST_PROXY
+      : rawEnvOrMap;
+
+  if (typeof rawEnvValue === 'string' && rawEnvValue.trim() !== '') {
+    const cleaned = rawEnvValue.trim().toLowerCase();
+    if (cleaned === 'false' || cleaned === '0' || cleaned === 'off' || cleaned === 'none') {
+      return false;
+    }
+    if (cleaned === 'true') {
+      return 1;
+    }
+    const parsed = Number.parseInt(cleaned, 10);
+    if (Number.isInteger(parsed) && parsed > 0 && parsed <= 10) {
+      return parsed;
+    }
+  }
+  return isCloudRun || nodeEnv === 'production' ? 1 : false;
+}
+
+/**
+ * Normalizes the client IP address for rate-limiting without ever trusting raw client-supplied
+ * X-Forwarded-For headers directly.
+ * - When proxy trust is disabled (`trustProxy === false`), strictly uses `req.socket.remoteAddress`.
+ * - When proxy trust is enabled to a fixed hop count in Express (`app.set('trust proxy', N)`),
+ *   uses `req.ip` (computed by Express from the trusted rightmost proxy hop) with fallback to `req.socket.remoteAddress`.
+ */
+export function normalizeClientIp(
+  req: Pick<Request, 'ip' | 'socket'> & {
+    app?: { get?: (setting: string) => unknown };
+    headers?: Record<string, unknown>;
+  },
+  options?: { trustProxy?: boolean | number }
+): string {
+  const appTrustProxy =
+    options?.trustProxy !== undefined
+      ? options.trustProxy
+      : typeof req.app?.get === 'function'
+      ? req.app.get('trust proxy')
+      : undefined;
+
+  const rawIp =
+    appTrustProxy === false
+      ? req.socket?.remoteAddress || req.ip || 'unknown'
+      : req.ip || req.socket?.remoteAddress || 'unknown';
+
+  let normalized = String(rawIp).trim().toLowerCase();
+  if (normalized.startsWith('::ffff:')) {
+    normalized = normalized.slice('::ffff:'.length);
+  }
+  return normalized.slice(0, 128) || 'unknown';
 }
 
 /**
@@ -80,7 +144,7 @@ export function createBoundedRateLimiter(
 
     const customPart = options.keyGenerator
       ? options.keyGenerator(req)
-      : `${normalizeClientIp(req)}:${req.baseUrl || ''}${req.path || ''}`;
+      : `${normalizeClientIp(req, { trustProxy: options.trustProxy })}:${req.baseUrl || ''}${req.path || ''}`;
     const key = `${scope}:${customPart.slice(0, 256)}`;
 
     const existing = store.get(key);

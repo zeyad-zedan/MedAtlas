@@ -1294,6 +1294,9 @@ export const ProfileSettingsView: React.FC<{
 }> = ({ user, onUserUpdated, onAccountDeleted }) => {
   const [displayName, setDisplayName] = useState(user.displayName);
   const [saving, setSaving] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [savingPassword, setSavingPassword] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
@@ -1311,6 +1314,30 @@ export const ProfileSettingsView: React.FC<{
       setErrorMsg(err.message || 'Failed to update profile.');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handlePasswordUpdate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSavingPassword(true);
+    setStatusMsg(null);
+    setErrorMsg(null);
+    try {
+      if (user.hasPassword !== false) {
+        const res = await api.changePassword(currentPassword, newPassword);
+        onUserUpdated(res.user);
+        setStatusMsg(res.message || 'Password updated and older sessions revoked.');
+      } else {
+        const res = await api.linkPassword(newPassword);
+        onUserUpdated(res.user);
+        setStatusMsg(res.message || 'Local password linked to your account.');
+      }
+      setCurrentPassword('');
+      setNewPassword('');
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to update password.');
+    } finally {
+      setSavingPassword(false);
     }
   };
 
@@ -1417,6 +1444,80 @@ export const ProfileSettingsView: React.FC<{
             className="px-5 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
           >
             {saving ? 'Saving...' : 'Save Display Name'}
+          </button>
+        </div>
+      </form>
+
+      {/* Authenticated Password Change / Provider Account Password Linking */}
+      <form
+        onSubmit={handlePasswordUpdate}
+        className="bg-white rounded-xl border border-slate-200 p-6 space-y-4"
+      >
+        <div>
+          <h2 className="text-base font-bold text-slate-900">
+            {user.hasPassword !== false
+              ? 'Change Account Password'
+              : 'Link Local Password to Account'}
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            {user.hasPassword !== false
+              ? 'Updating your password automatically increments your session version and revokes any older active sessions.'
+              : 'Attach a local password to your verified provider account so you can sign in with either Google or Email & Password.'}
+          </p>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+          {user.hasPassword !== false && (
+            <div>
+              <label
+                htmlFor="profile-current-password"
+                className="block font-semibold text-slate-700 mb-1"
+              >
+                Current Password
+              </label>
+              <input
+                id="profile-current-password"
+                type="password"
+                required
+                value={currentPassword}
+                onChange={(e) => setCurrentPassword(e.target.value)}
+                placeholder="••••••••"
+                className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+              />
+            </div>
+          )}
+
+          <div>
+            <label
+              htmlFor="profile-new-password"
+              className="block font-semibold text-slate-700 mb-1"
+            >
+              New Password (min 8 characters)
+            </label>
+            <input
+              id="profile-new-password"
+              type="password"
+              required
+              minLength={8}
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              placeholder="••••••••"
+              className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+            />
+          </div>
+        </div>
+
+        <div className="pt-2 flex justify-end">
+          <button
+            type="submit"
+            disabled={savingPassword}
+            className="px-5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer"
+          >
+            {savingPassword
+              ? 'Updating...'
+              : user.hasPassword !== false
+              ? 'Update Password'
+              : 'Link Password'}
           </button>
         </div>
       </form>

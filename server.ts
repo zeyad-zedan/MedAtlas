@@ -1,4 +1,4 @@
-import express, { type Response, type NextFunction } from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'node:path';
 import * as dotenv from 'dotenv';
 import {
@@ -6,14 +6,24 @@ import {
   type AuthRequest,
   verifyPassword,
   createServerSessionToken,
+  validateAuthConfiguration,
 } from './src/middleware/auth.ts';
 import {
-  ensureSeededDatabase,
-  isSoleAdminEmail,
+  createBoundedRateLimiter,
+  normalizeClientIp,
+} from './src/middleware/rate-limit.ts';
+import {
+  ClientSafeError,
+  sanitizeUserForClient,
+  getAuthenticatedUserByUid,
   getOrCreateUser,
   registerEmailPasswordUser,
   findUserByEmail,
-  resetUserPasswordByEmail,
+  requestPasswordRecoveryToken,
+  confirmPasswordRecoveryToken,
+  changeAuthenticatedUserPassword,
+  linkPasswordToAuthenticatedAccount,
+  revokeUserSessions,
   updateUserProfile,
   deleteUserAccount,
   getPublishedCatalog,
@@ -28,55 +38,133 @@ import {
   upsertSubjectAdmin,
   upsertLectureAdmin,
   upsertQuestionAdmin,
+  deleteSubjectAdmin,
+  deleteLectureAdmin,
+  deleteQuestionBankAdmin,
   deleteOrArchiveQuestionAdmin,
+  deleteExamSessionAdmin,
+  updateUserRoleAdmin,
+  deleteUserAdmin,
   previewCsvImportAdmin,
   executeCsvImportAdmin,
   exportQuestionBankCsvAdmin,
 } from './src/db/repository.ts';
 import { getSampleCsvTemplate } from './src/lib/mcq-engine.ts';
 
-dotenv.config();
+dotenv.config({ override: true });
 
-const app = express();
+// Validate AUTH_SESSION_SECRET at module load / startup (fails fast if missing or weak)
+validateAuthConfiguration();
+
+export const app = express();
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+
+// Security headers middleware
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader(
+    'Permissions-Policy',
+    'camera=(), microphone=(), geolocation=(), payment=()'
+  );
+  next();
+});
+
 app.use(express.json({ limit: '5mb' }));
 
-// Simple in-memory rate limiter for auth and sensitive mutations
-const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
-function rateLimit(maxRequests: number, windowMs: number) {
-  return (req: express.Request, res: Response, next: NextFunction) => {
-    const key = `${req.ip}:${req.path}`;
-    const now = Date.now();
-    const record = rateLimitMap.get(key);
-    if (!record || now > record.resetAt) {
-      rateLimitMap.set(key, { count: 1, resetAt: now + windowMs });
-      return next();
-    }
-    if (record.count >= maxRequests) {
-      return res
-        .status(429)
-        .json({ error: 'Too many requests. Please wait a moment and try again.' });
-    }
-    record.count++;
-    return next();
-  };
+// Bounded, self-pruning rate limiters for authentication and sensitive mutations
+const registerLimiter = createBoundedRateLimiter({
+  scope: 'auth-register',
+  maxRequests: 15,
+  windowMs: 60_000,
+  maxKeys: 5_000,
+});
+
+const loginLimiter = createBoundedRateLimiter({
+  scope: 'auth-login',
+  maxRequests: 20,
+  windowMs: 60_000,
+  maxKeys: 5_000,
+  keyGenerator: (req) => {
+    const email =
+      typeof req.body?.email === 'string'
+        ? req.body.email.toLowerCase().trim().slice(0, 80)
+        : '';
+    return `${normalizeClientIp(req)}:${email}`;
+  },
+});
+
+const forgotPasswordLimiter = createBoundedRateLimiter({
+  scope: 'auth-forgot-password',
+  maxRequests: 6,
+  windowMs: 60_000,
+  maxKeys: 5_000,
+  keyGenerator: (req) => {
+    const email =
+      typeof req.body?.email === 'string'
+        ? req.body.email.toLowerCase().trim().slice(0, 80)
+        : '';
+    return `${normalizeClientIp(req)}:${email}`;
+  },
+});
+
+const resetPasswordLimiter = createBoundedRateLimiter({
+  scope: 'auth-reset-password',
+  maxRequests: 10,
+  windowMs: 60_000,
+  maxKeys: 5_000,
+});
+
+const passwordMutationLimiter = createBoundedRateLimiter({
+  scope: 'auth-password-mutation',
+  maxRequests: 10,
+  windowMs: 60_000,
+  maxKeys: 5_000,
+});
+
+function sendErrorResponse(
+  res: Response,
+  error: unknown,
+  fallbackMessage: string,
+  defaultStatus = 500
+) {
+  if (error instanceof ClientSafeError) {
+    return res.status(error.statusCode).json({ error: error.message });
+  }
+  return res.status(defaultStatus).json({ error: fallbackMessage });
 }
 
-// Middleware to verify database-backed Administrator role (exclusively zeyadzedan098@gmail.com)
+// Middleware to verify database-backed Administrator role without creating or resurrecting users
 const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required.' });
     }
-    const dbUser = await getOrCreateUser(req.user.uid, req.user.email, req.user.name);
-    if (!dbUser || dbUser.role !== 'admin' || !isSoleAdminEmail(dbUser.email)) {
+    const dbUser =
+      req.user.authType === 'firebase'
+        ? await getOrCreateUser(req.user.uid, req.user.email, req.user.name, {
+            authType: 'firebase',
+            emailVerified: req.user.emailVerified,
+            allowCreate: true,
+          })
+        : await getAuthenticatedUserByUid(req.user.uid);
+
+    if (!dbUser || dbUser.role !== 'admin') {
       return res
         .status(403)
-        .json({ error: 'Forbidden: Administrator privileges are restricted to the platform owner.' });
+        .json({ error: 'Forbidden: Administrator privileges are required.' });
     }
     return next();
-  } catch (error: any) {
+  } catch (error) {
     console.error('Admin verification failed:', error);
-    return res.status(500).json({ error: 'Failed to verify administrator permissions.' });
+    return sendErrorResponse(
+      res,
+      error,
+      'Failed to verify administrator permissions.',
+      500
+    );
   }
 };
 
@@ -86,16 +174,16 @@ const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction)
 app.get('/api/catalog', async (_req, res) => {
   try {
     const catalog = await getPublishedCatalog();
-    res.json(catalog);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to load catalog.' });
+    return res.json(catalog);
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to load catalog.', 500);
   }
 });
 
 // ============================================================================
 // AUTHENTICATION & ACCOUNT API
 // ============================================================================
-app.post('/api/auth/register', rateLimit(15, 60_000), async (req, res) => {
+app.post('/api/auth/register', registerLimiter, async (req, res) => {
   try {
     const { email, password, displayName } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
@@ -107,9 +195,9 @@ app.post('/api/auth/register', rateLimit(15, 60_000), async (req, res) => {
         .json({ error: 'Password must be at least 8 characters long.' });
     }
     if (!displayName || typeof displayName !== 'string' || displayName.trim().length < 2) {
-      return res
-        .status(400)
-        .json({ error: 'Please enter your full name or display name (at least 2 characters).' });
+      return res.status(400).json({
+        error: 'Please enter your full name or display name (at least 2 characters).',
+      });
     }
 
     const user = await registerEmailPasswordUser(email, password, displayName);
@@ -117,16 +205,19 @@ app.post('/api/auth/register', rateLimit(15, 60_000), async (req, res) => {
       uid: user.uid,
       email: user.email,
       name: user.displayName,
+      tokenVersion: user.tokenVersion,
     });
 
-    const { passwordHash: _ph, ...safeUser } = user;
-    return res.status(201).json({ token, user: safeUser });
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Registration failed.' });
+    return res.status(201).json({
+      token,
+      user: sanitizeUserForClient(user),
+    });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Registration failed.', 400);
   }
 });
 
-app.post('/api/auth/login', rateLimit(20, 60_000), async (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {
@@ -142,42 +233,162 @@ app.post('/api/auth/login', rateLimit(20, 60_000), async (req, res) => {
       uid: user.uid,
       email: user.email,
       name: user.displayName,
+      tokenVersion: user.tokenVersion,
     });
 
-    const { passwordHash: _ph, ...safeUser } = user;
-    return res.json({ token, user: safeUser });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Login failed.' });
+    return res.json({
+      token,
+      user: sanitizeUserForClient(user),
+    });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Login failed.', 500);
   }
 });
 
-app.post('/api/auth/reset-password', rateLimit(10, 60_000), async (req, res) => {
+/**
+ * Step 1 of Password Recovery: Request a single-use cryptographic recovery token.
+ * Enumeration-safe: returns the same generic response whether or not the email exists.
+ */
+app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
   try {
-    const { email, newPassword } = req.body || {};
+    const { email } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
-      return res.status(400).json({ error: 'Please enter a valid account email address.' });
+      return res
+        .status(400)
+        .json({ error: 'Please enter a valid account email address.' });
+    }
+    const result = await requestPasswordRecoveryToken(email);
+    return res.json({
+      accepted: result.accepted,
+      message: result.message,
+      expiresInMinutes: result.expiresInMinutes,
+    });
+  } catch (error) {
+    return sendErrorResponse(
+      res,
+      error,
+      'Failed to initiate password recovery.',
+      400
+    );
+  }
+});
+
+/**
+ * Step 2 of Password Recovery: Complete password reset using a verified single-use recovery token.
+ * Unauthenticated reset by { email, newPassword } alone is strictly rejected.
+ */
+app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
+  try {
+    const { token, newPassword } = req.body || {};
+    if (!token || typeof token !== 'string' || token.trim().length < 32) {
+      return res.status(400).json({
+        error:
+          'A valid single-use password recovery token is required to reset a password.',
+      });
     }
     if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
       return res
         .status(400)
         .json({ error: 'New password must be at least 8 characters long.' });
     }
-    await resetUserPasswordByEmail(email, newPassword);
+
+    await confirmPasswordRecoveryToken(token, newPassword);
     return res.json({
-      message: 'Your password has been updated. You may now sign in with your new password.',
+      message:
+        'Your password has been updated and prior sessions have been revoked. You may now sign in with your new password.',
     });
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Password recovery failed.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Password recovery failed.', 400);
+  }
+});
+
+/**
+ * Authenticated password change (requires currentPassword).
+ */
+app.post(
+  '/api/auth/change-password',
+  requireAuth,
+  passwordMutationLimiter,
+  async (req: AuthRequest, res) => {
+    try {
+      const { currentPassword, newPassword } = req.body || {};
+      const updated = await changeAuthenticatedUserPassword(
+        req.user!.uid,
+        String(currentPassword || ''),
+        String(newPassword || '')
+      );
+      const token = createServerSessionToken({
+        uid: updated.uid,
+        email: updated.email,
+        name: updated.displayName,
+        tokenVersion: updated.tokenVersion,
+      });
+      return res.json({
+        message: 'Your password has been updated.',
+        token,
+        user: sanitizeUserForClient(updated),
+      });
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to change password.', 400);
+    }
+  }
+);
+
+/**
+ * Authenticated password linking for accounts created via verified OAuth/Firebase provider.
+ */
+app.post(
+  '/api/auth/link-password',
+  requireAuth,
+  passwordMutationLimiter,
+  async (req: AuthRequest, res) => {
+    try {
+      const { newPassword } = req.body || {};
+      const updated = await linkPasswordToAuthenticatedAccount(
+        req.user!.uid,
+        String(newPassword || '')
+      );
+      const token = createServerSessionToken({
+        uid: updated.uid,
+        email: updated.email,
+        name: updated.displayName,
+        tokenVersion: updated.tokenVersion,
+      });
+      return res.json({
+        message: 'Local password has been linked to your account.',
+        token,
+        user: sanitizeUserForClient(updated),
+      });
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to link password.', 400);
+    }
+  }
+);
+
+app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    await revokeUserSessions(req.user!.uid);
+    return res.json({ loggedOut: true });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to revoke session.', 500);
   }
 });
 
 app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res) => {
   try {
-    const user = await getOrCreateUser(req.user!.uid, req.user!.email, req.user!.name);
-    const { passwordHash: _ph, ...safeUser } = user;
-    return res.json({ user: safeUser });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to load profile.' });
+    const user = await getOrCreateUser(
+      req.user!.uid,
+      req.user!.email,
+      req.user!.name,
+      {
+        authType: req.user!.authType,
+        emailVerified: req.user!.emailVerified,
+        allowCreate: req.user!.authType === 'firebase',
+      }
+    );
+    return res.json({ user: sanitizeUserForClient(user) });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to load profile.', 500);
   }
 });
 
@@ -193,10 +404,9 @@ app.put('/api/auth/profile', requireAuth, async (req: AuthRequest, res) => {
       displayName: displayName ? String(displayName) : undefined,
       preferences: typeof preferences === 'object' ? preferences : undefined,
     });
-    const { passwordHash: _ph, ...safeUser } = updated;
-    return res.json({ user: safeUser });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to update profile.' });
+    return res.json({ user: sanitizeUserForClient(updated) });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to update profile.', 500);
   }
 });
 
@@ -204,8 +414,8 @@ app.delete('/api/auth/account', requireAuth, async (req: AuthRequest, res) => {
   try {
     const result = await deleteUserAccount(req.user!.uid);
     return res.json(result);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to delete account.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to delete account.', 500);
   }
 });
 
@@ -246,8 +456,8 @@ app.post('/api/sessions', requireAuth, async (req: AuthRequest, res) => {
           : undefined,
     });
     return res.status(201).json(result);
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Could not start session.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Could not start session.', 400);
   }
 });
 
@@ -259,15 +469,17 @@ app.get('/api/sessions/:id', requireAuth, async (req: AuthRequest, res) => {
     }
     const session = await getExamSessionForStudent(req.user!.uid, sessionId);
     return res.json({ session });
-  } catch (error: any) {
-    const status = error.message?.includes('Forbidden') ? 403 : 404;
-    return res.status(status).json({ error: error.message || 'Session not found.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Session not found.', 404);
   }
 });
 
 app.post('/api/sessions/:id/answer', requireAuth, async (req: AuthRequest, res) => {
   try {
     const sessionId = Number(req.params.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+      return res.status(400).json({ error: 'Invalid session ID.' });
+    }
     const { questionId, selectedOption, lockAnswer, elapsedSeconds } = req.body || {};
     const session = await saveSessionQuestionAnswer(
       req.user!.uid,
@@ -278,15 +490,17 @@ app.post('/api/sessions/:id/answer', requireAuth, async (req: AuthRequest, res) 
       typeof elapsedSeconds === 'number' ? elapsedSeconds : undefined
     );
     return res.json({ session });
-  } catch (error: any) {
-    const status = error.message?.includes('Forbidden') ? 403 : 400;
-    return res.status(status).json({ error: error.message || 'Failed to record answer.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to record answer.', 400);
   }
 });
 
 app.post('/api/sessions/:id/complete', requireAuth, async (req: AuthRequest, res) => {
   try {
     const sessionId = Number(req.params.id);
+    if (!Number.isInteger(sessionId) || sessionId <= 0) {
+      return res.status(400).json({ error: 'Invalid session ID.' });
+    }
     const { answers, elapsedSeconds } = req.body || {};
     const session = await completeExamSession(
       req.user!.uid,
@@ -295,9 +509,8 @@ app.post('/api/sessions/:id/complete', requireAuth, async (req: AuthRequest, res
       typeof elapsedSeconds === 'number' ? elapsedSeconds : undefined
     );
     return res.json({ session });
-  } catch (error: any) {
-    const status = error.message?.includes('Forbidden') ? 403 : 400;
-    return res.status(status).json({ error: error.message || 'Failed to complete session.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to complete session.', 400);
   }
 });
 
@@ -305,8 +518,8 @@ app.get('/api/dashboard', requireAuth, async (req: AuthRequest, res) => {
   try {
     const analytics = await getStudentDashboardAnalytics(req.user!.uid);
     return res.json(analytics);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to load dashboard.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to load dashboard.', 500);
   }
 });
 
@@ -314,8 +527,8 @@ app.get('/api/bookmarks', requireAuth, async (req: AuthRequest, res) => {
   try {
     const data = await getStudentBookmarksAndReview(req.user!.uid);
     return res.json(data);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to load bookmarks.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to load bookmarks.', 500);
   }
 });
 
@@ -331,8 +544,8 @@ app.post('/api/bookmarks/toggle', requireAuth, async (req: AuthRequest, res) => 
       note ? String(note) : undefined
     );
     return res.json(result);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to toggle bookmark.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to toggle bookmark.', 500);
   }
 });
 
@@ -343,8 +556,8 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, async (_req: AuthReque
   try {
     const data = await getAdminDashboardData();
     return res.json(data);
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Failed to load admin overview.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to load admin overview.', 500);
   }
 });
 
@@ -365,8 +578,8 @@ app.post('/api/admin/subjects', requireAuth, requireAdmin, async (req: AuthReque
       }
     );
     return res.json({ subject: saved });
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Failed to save subject.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to save subject.', 400);
   }
 });
 
@@ -401,8 +614,8 @@ app.post('/api/admin/lectures', requireAuth, requireAdmin, async (req: AuthReque
       }
     );
     return res.json({ lecture: saved });
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Failed to save lecture.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to save lecture.', 400);
   }
 });
 
@@ -468,10 +681,64 @@ app.post('/api/admin/questions', requireAuth, requireAdmin, async (req: AuthRequ
       }
     );
     return res.json({ question: saved });
-  } catch (error: any) {
-    return res.status(400).json({ error: error.message || 'Failed to save question.' });
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to save question.', 400);
   }
 });
+
+app.delete(
+  '/api/admin/subjects/:id',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const subjectId = Number(req.params.id);
+      const result = await deleteSubjectAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        subjectId
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete subject.', 400);
+    }
+  }
+);
+
+app.delete(
+  '/api/admin/lectures/:id',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const lectureId = Number(req.params.id);
+      const result = await deleteLectureAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        lectureId
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete lecture.', 400);
+    }
+  }
+);
+
+app.delete(
+  '/api/admin/question-banks/:id',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const bankId = Number(req.params.id);
+      const result = await deleteQuestionBankAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        bankId
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete quiz bank.', 400);
+    }
+  }
+);
 
 app.delete(
   '/api/admin/questions/:id',
@@ -485,8 +752,64 @@ app.delete(
         questionId
       );
       return res.json(result);
-    } catch (error: any) {
-      return res.status(400).json({ error: error.message || 'Failed to delete question.' });
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete question.', 400);
+    }
+  }
+);
+
+app.delete(
+  '/api/admin/sessions/:id',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const sessionId = Number(req.params.id);
+      const result = await deleteExamSessionAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        sessionId
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete quiz session.', 400);
+    }
+  }
+);
+
+app.put(
+  '/api/admin/users/:uid/role',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const targetUid = String(req.params.uid);
+      const role = req.body?.role === 'admin' ? 'admin' : 'student';
+      const result = await updateUserRoleAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        targetUid,
+        role
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to update user role.', 400);
+    }
+  }
+);
+
+app.delete(
+  '/api/admin/users/:uid',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      const targetUid = String(req.params.uid);
+      const result = await deleteUserAdmin(
+        { uid: req.user!.uid, email: req.user!.email },
+        targetUid
+      );
+      return res.json(result);
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to delete user.', 400);
     }
   }
 );
@@ -510,8 +833,8 @@ app.post(
       }
       const preview = await previewCsvImportAdmin(csvContent);
       return res.json(preview);
-    } catch (error: any) {
-      return res.status(400).json({ error: error.message || 'Failed to validate CSV.' });
+    } catch (error) {
+      return sendErrorResponse(res, error, 'Failed to validate CSV.', 400);
     }
   }
 );
@@ -532,8 +855,8 @@ app.post(
         csvContent
       );
       return res.json(result);
-    } catch (error: any) {
-      return res.status(400).json({ error: error.message || 'CSV import failed.' });
+    } catch (error) {
+      return sendErrorResponse(res, error, 'CSV import failed.', 400);
     }
   }
 );
@@ -542,10 +865,13 @@ app.get('/api/admin/export-csv', requireAuth, requireAdmin, async (_req, res) =>
   try {
     const csv = await exportQuestionBankCsvAdmin();
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', 'attachment; filename="medatlas_question_bank_backup.csv"');
-    res.send(csv);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to export question bank.' });
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="medatlas_question_bank_backup.csv"'
+    );
+    return res.send(csv);
+  } catch (error) {
+    return sendErrorResponse(res, error, 'Failed to export question bank.', 500);
   }
 });
 
@@ -575,4 +901,6 @@ async function startServer() {
   });
 }
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}

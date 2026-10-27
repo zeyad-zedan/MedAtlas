@@ -12,7 +12,7 @@ import {
   RotateCcw,
 } from 'lucide-react';
 import { api } from '../lib/api.ts';
-import { OPTION_KEYS, OptionKey } from '../lib/mcq-engine.ts';
+import { OPTION_KEYS, OptionKey, sanitizeSvgDiagram } from '../lib/mcq-engine.ts';
 
 interface McqSessionPlayerProps {
   initialSession: any;
@@ -419,7 +419,9 @@ export const McqSessionPlayer: React.FC<McqSessionPlayerProps> = ({
             {currentQ.diagramSvg && (
               <div
                 className="my-4"
-                dangerouslySetInnerHTML={{ __html: currentQ.diagramSvg }}
+                dangerouslySetInnerHTML={{
+                  __html: sanitizeSvgDiagram(currentQ.diagramSvg),
+                }}
               />
             )}
           </div>

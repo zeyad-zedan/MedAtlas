@@ -1,4 +1,4 @@
-import { eq, and, desc, asc, inArray } from 'drizzle-orm';
+import { eq, and, desc, asc, inArray, isNull, sql } from 'drizzle-orm';
 import { db } from './index.ts';
 import {
   users,
@@ -11,8 +11,9 @@ import {
   bookmarks,
   importBatches,
   adminAuditLogs,
+  passwordResetTokens,
+  deletedAccounts,
 } from './schema.ts';
-import { INITIAL_CURRICULUM_SEED } from './seed-data.ts';
 import {
   computeContentHash,
   createOptionPermutation,
@@ -22,6 +23,7 @@ import {
   selectPracticeQuestions,
   computeTopicPerformance,
   parseAndValidateCsvQuestions,
+  OPTION_KEYS,
 } from '../lib/mcq-engine.ts';
 import type {
   OptionKey,
@@ -30,126 +32,118 @@ import type {
   ContentStatus,
   CanonicalQuestion,
 } from '../lib/mcq-engine.ts';
-import { hashPassword } from '../middleware/auth.ts';
+import {
+  hashPassword,
+  verifyPassword,
+  generateRecoveryToken,
+  hashRecoveryToken,
+  hashEmailForTombstone,
+} from '../middleware/auth.ts';
+import { adminAuth } from '../lib/firebase-admin.ts';
 
-export const SOLE_ADMIN_EMAIL = 'zeyadzedan098@gmail.com';
+export const OWNER_ADMIN_EMAIL = 'zeyadzedan098@gmail.com';
+export const EXAM_SUBMISSION_GRACE_SECONDS = 15;
+export const GENERIC_PASSWORD_RECOVERY_MESSAGE =
+  'If an account exists for that email address, password recovery instructions have been initiated.';
 
-export function isSoleAdminEmail(email: string): boolean {
-  return email.toLowerCase().trim() === SOLE_ADMIN_EMAIL;
-}
+/**
+ * Error class representing messages that are safe to return to the client
+ * with an explicit HTTP status code. Unexpected internal errors do not use this class
+ * and are masked with a generic message at the HTTP boundary.
+ */
+export class ClientSafeError extends Error {
+  public readonly statusCode: number;
 
-let isSeeded = false;
-
-export async function ensureSeededDatabase() {
-  if (isSeeded) return;
-  try {
-    const existingSubjects = await db.select().from(subjects);
-    if (existingSubjects.length > 0) {
-      isSeeded = true;
-      return;
-    }
-
-    for (const subjSeed of INITIAL_CURRICULUM_SEED) {
-      const [insertedSubj] = await db
-        .insert(subjects)
-        .values({
-          slug: subjSeed.slug,
-          title: subjSeed.title,
-          description: subjSeed.description,
-          displayOrder: subjSeed.displayOrder,
-          status: 'published',
-        })
-        .returning();
-
-      for (const lectSeed of subjSeed.lectures) {
-        const [insertedLect] = await db
-          .insert(lectures)
-          .values({
-            subjectId: insertedSubj.id,
-            title: lectSeed.title,
-            description: lectSeed.description,
-            lectureNumber: lectSeed.lectureNumber,
-            educationalNotes: lectSeed.educationalNotes,
-            estimatedMinutes: lectSeed.estimatedMinutes,
-            status: 'published',
-          })
-          .returning();
-
-        const [practiceBank] = await db
-          .insert(questionBanks)
-          .values({
-            subjectId: insertedSubj.id,
-            lectureId: insertedLect.id,
-            title: `${lectSeed.title} — Practice Bank`,
-            description: `Untimed formative study questions and explanations for ${lectSeed.title}.`,
-            bankType: 'practice',
-            timeLimitMinutes: null,
-            isPremium: false,
-            status: 'published',
-          })
-          .returning();
-
-        await db.insert(questionBanks).values({
-          subjectId: insertedSubj.id,
-          lectureId: insertedLect.id,
-          title: `${lectSeed.title} — Timed Mock Exam`,
-          description: `Exam-simulation assessment with hidden answers until submission.`,
-          bankType: 'mock_exam',
-          timeLimitMinutes: 15,
-          isPremium: false,
-          status: 'published',
-        });
-
-        for (const qSeed of lectSeed.questions) {
-          const contentHash = computeContentHash(
-            `${subjSeed.title}|${lectSeed.title}|${qSeed.questionText}|${qSeed.optionA}|${qSeed.optionB}|${qSeed.optionC}|${qSeed.optionD}`
-          );
-
-          await db.insert(questions).values({
-            subjectId: insertedSubj.id,
-            lectureId: insertedLect.id,
-            questionBankId: practiceBank.id,
-            questionText: qSeed.questionText,
-            optionA: qSeed.optionA,
-            optionB: qSeed.optionB,
-            optionC: qSeed.optionC,
-            optionD: qSeed.optionD,
-            correctAnswer: qSeed.correctAnswer,
-            explanation: qSeed.explanation,
-            explanationA: qSeed.explanationA,
-            explanationB: qSeed.explanationB,
-            explanationC: qSeed.explanationC,
-            explanationD: qSeed.explanationD,
-            difficulty: qSeed.difficulty,
-            tags: qSeed.tags,
-            diagramSvg: qSeed.diagramSvg || '',
-            status: 'published',
-            version: 1,
-            contentHash,
-          });
-        }
-      }
-    }
-
-    isSeeded = true;
-  } catch (error) {
-    console.error('Database seed check failed:', error);
-    throw new Error('Failed to initialize curriculum database.', { cause: error });
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = 'ClientSafeError';
+    this.statusCode = statusCode;
   }
 }
 
+export function isOwnerAdminEmail(email: string): boolean {
+  return email.toLowerCase().trim() === OWNER_ADMIN_EMAIL;
+}
+
+export async function ensureSeededDatabase() {
+  // Automatic sample seeding is disabled so deleted subjects, lectures, and quizzes remain permanently deleted.
+  return;
+}
+
+export function sanitizeUserForClient<T extends { passwordHash?: string | null }>(
+  user: T
+): Omit<T, 'passwordHash'> & { hasPassword: boolean } {
+  const { passwordHash, ...safeUser } = user;
+  return {
+    ...safeUser,
+    hasPassword: Boolean(passwordHash && passwordHash.length > 0),
+  };
+}
+
+/**
+ * Looks up an already-existing active user by UID without creating or resurrecting accounts.
+ */
+export async function getAuthenticatedUserByUid(uid: string) {
+  const tombstones = await db
+    .select()
+    .from(deletedAccounts)
+    .where(eq(deletedAccounts.uid, uid));
+
+  if (tombstones.length > 0) {
+    throw new ClientSafeError('Unauthorized: This account has been deleted.', 401);
+  }
+
+  const rows = await db.select().from(users).where(eq(users.uid, uid));
+  const user = rows[0];
+  if (!user || user.accountStatus !== 'active' || user.deletedAt !== null) {
+    return null;
+  }
+
+  if (isOwnerAdminEmail(user.email) && user.role !== 'admin') {
+    const [promotedOwner] = await db
+      .update(users)
+      .set({ role: 'admin', updatedAt: new Date() })
+      .where(eq(users.uid, uid))
+      .returning();
+    return promotedOwner;
+  }
+
+  return user;
+}
+
+/**
+ * Synchronizes or provisions a user authenticated via a verified Firebase ID token,
+ * or returns the existing database profile for a local session user.
+ * Never resurrects deleted accounts and never overwrites an existing user's UID.
+ */
 export async function getOrCreateUser(
   uid: string,
   email: string,
-  displayName?: string
+  displayName?: string,
+  options?: {
+    authType?: 'local' | 'firebase';
+    emailVerified?: boolean;
+    allowCreate?: boolean;
+  }
 ) {
   try {
     await ensureSeededDatabase();
     const normalizedEmail = email.toLowerCase().trim();
-    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
+    const isOwner = isOwnerAdminEmail(normalizedEmail);
     const defaultName =
       displayName?.trim() || normalizedEmail.split('@')[0] || 'Medical Student';
 
+    // 1. Check tombstone table first so deleted UIDs can never be resurrected
+    const tombstoneRows = await db
+      .select()
+      .from(deletedAccounts)
+      .where(eq(deletedAccounts.uid, uid));
+
+    if (tombstoneRows.length > 0) {
+      throw new ClientSafeError('Unauthorized: This account has been deleted.', 401);
+    }
+
+    // 2. Check existing user by UID
     const existingByUid = await db
       .select()
       .from(users)
@@ -157,63 +151,87 @@ export async function getOrCreateUser(
 
     if (existingByUid.length > 0) {
       const user = existingByUid[0];
-      if (user.role !== expectedRole) {
-        const [updatedRoleUser] = await db
+      if (user.accountStatus !== 'active' || user.deletedAt !== null) {
+        throw new ClientSafeError('Unauthorized: This account has been deactivated or deleted.', 401);
+      }
+      if (isOwner && user.role !== 'admin') {
+        const [promotedOwner] = await db
           .update(users)
-          .set({ role: expectedRole, updatedAt: new Date() })
+          .set({ role: 'admin', updatedAt: new Date() })
           .where(eq(users.uid, uid))
           .returning();
-        return updatedRoleUser;
+        return promotedOwner;
       }
       return user;
     }
 
+    // Local session tokens must correspond to an already-registered database row;
+    // never auto-create a user from a local token if the row was deleted.
+    if (options?.authType === 'local' || options?.allowCreate === false || uid.startsWith('usr_')) {
+      throw new ClientSafeError('Unauthorized: Account no longer exists.', 401);
+    }
+
+    // 3. For Firebase-authenticated users, require verified email before provisioning
+    if (options?.emailVerified === false) {
+      throw new ClientSafeError(
+        'Forbidden: A verified email address is required to create or access an account.',
+        403
+      );
+    }
+
+    // 4. Check if another account already owns this email address.
+    // Never overwrite an existing account's UID!
     const existingByEmail = await db
       .select()
       .from(users)
       .where(eq(users.email, normalizedEmail));
 
     if (existingByEmail.length > 0) {
-      const [updated] = await db
-        .update(users)
-        .set({
-          uid,
-          role: expectedRole,
-          updatedAt: new Date(),
-        })
-        .where(eq(users.email, normalizedEmail))
-        .returning();
-      return updated;
+      const existingUser = existingByEmail[0];
+      if (existingUser.uid !== uid) {
+        throw new ClientSafeError(
+          'An account with this email address already exists under a different sign-in method. Please sign in using your original credentials.',
+          409
+        );
+      }
+      return existingUser;
     }
 
+    const initialRole = isOwner ? 'admin' : 'student';
     const [created] = await db
       .insert(users)
       .values({
         uid,
         email: normalizedEmail,
         displayName: defaultName,
-        role: expectedRole,
+        authProvider: 'firebase',
+        role: initialRole,
         subscriptionTier: 'free_trial',
         subscriptionStatus: 'active',
+        accountStatus: 'active',
+        tokenVersion: 1,
         emailVerified: true,
-      })
-      .onConflictDoUpdate({
-        target: users.uid,
-        set: {
-          email: normalizedEmail,
-          role: expectedRole,
-          updatedAt: new Date(),
-        },
       })
       .returning();
 
     return created;
-  } catch (error) {
+  } catch (error: any) {
+    if (error instanceof ClientSafeError) throw error;
+    if (error?.code === '23505') {
+      throw new ClientSafeError(
+        'An account with this email address already exists.',
+        409
+      );
+    }
     console.error('Database error in getOrCreateUser:', error);
     throw new Error('Failed to synchronize user profile.', { cause: error });
   }
 }
 
+/**
+ * Registers a brand-new local email/password user.
+ * Security guarantee: NEVER attaches a password to an existing user account (whether local or provider-based).
+ */
 export async function registerEmailPasswordUser(
   email: string,
   password: string,
@@ -222,7 +240,20 @@ export async function registerEmailPasswordUser(
   try {
     await ensureSeededDatabase();
     const normalizedEmail = email.toLowerCase().trim();
-    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      throw new ClientSafeError('Please provide a valid email address.', 400);
+    }
+    if (!password || password.length < 8) {
+      throw new ClientSafeError('Password must be at least 8 characters long.', 400);
+    }
+    if (!displayName || displayName.trim().length < 2) {
+      throw new ClientSafeError(
+        'Please enter your full name or display name (at least 2 characters).',
+        400
+      );
+    }
+
+    const isOwner = isOwnerAdminEmail(normalizedEmail);
     const passwordHash = hashPassword(password);
 
     const existing = await db
@@ -231,42 +262,51 @@ export async function registerEmailPasswordUser(
       .where(eq(users.email, normalizedEmail));
 
     if (existing.length > 0) {
-      // If account was previously created via Google Sign-In without a passwordHash, attach the passwordHash
-      if (!existing[0].passwordHash) {
-        const [linked] = await db
-          .update(users)
-          .set({
-            displayName: displayName.trim() || existing[0].displayName,
-            passwordHash,
-            role: expectedRole,
-            updatedAt: new Date(),
-          })
-          .where(eq(users.email, normalizedEmail))
-          .returning();
-        return linked;
-      }
-      throw new Error('An account with this email address already exists.');
+      // Uniform conflict error: never attach a password to an existing account during unauthenticated registration
+      throw new ClientSafeError(
+        'An account with this email address already exists. Please sign in instead.',
+        409
+      );
     }
 
-    const uid = `usr_${computeContentHash(`${normalizedEmail}_${Date.now()}`)}`;
+    const uid = `usr_${computeContentHash(`${normalizedEmail}_${Date.now()}_${Math.random()}`)}`;
+    const initialRole = isOwner ? 'admin' : 'student';
 
-    const [created] = await db
-      .insert(users)
-      .values({
-        uid,
-        email: normalizedEmail,
-        displayName: displayName.trim() || normalizedEmail.split('@')[0],
-        passwordHash,
-        role: expectedRole,
-        subscriptionTier: 'free_trial',
-        subscriptionStatus: 'active',
-        emailVerified: true,
-      })
-      .returning();
+    const created = await db.transaction(async (tx) => {
+      // Clear any historical email-hash tombstone if this email is re-registering fresh with a brand-new UID
+      await tx
+        .delete(deletedAccounts)
+        .where(eq(deletedAccounts.emailHash, hashEmailForTombstone(normalizedEmail)));
+
+      const [inserted] = await tx
+        .insert(users)
+        .values({
+          uid,
+          email: normalizedEmail,
+          displayName: displayName.trim(),
+          passwordHash,
+          authProvider: 'local',
+          role: initialRole,
+          subscriptionTier: 'free_trial',
+          subscriptionStatus: 'active',
+          accountStatus: 'active',
+          tokenVersion: 1,
+          emailVerified: true,
+        })
+        .returning();
+
+      return inserted;
+    });
 
     return created;
   } catch (error: any) {
-    if (error.message?.includes('already exists')) throw error;
+    if (error instanceof ClientSafeError) throw error;
+    if (error?.code === '23505') {
+      throw new ClientSafeError(
+        'An account with this email address already exists. Please sign in instead.',
+        409
+      );
+    }
     console.error('Error registering user:', error);
     throw new Error('Failed to register account. Please try again.', { cause: error });
   }
@@ -281,16 +321,17 @@ export async function findUserByEmail(email: string) {
       .from(users)
       .where(eq(users.email, normalizedEmail));
     const user = rows[0] || null;
-    if (!user) return null;
+    if (!user || user.accountStatus !== 'active' || user.deletedAt !== null) {
+      return null;
+    }
 
-    const expectedRole = isSoleAdminEmail(normalizedEmail) ? 'admin' : 'student';
-    if (user.role !== expectedRole) {
-      const [normalizedUser] = await db
+    if (isOwnerAdminEmail(normalizedEmail) && user.role !== 'admin') {
+      const [promotedOwner] = await db
         .update(users)
-        .set({ role: expectedRole, updatedAt: new Date() })
+        .set({ role: 'admin', updatedAt: new Date() })
         .where(eq(users.uid, user.uid))
         .returning();
-      return normalizedUser;
+      return promotedOwner;
     }
     return user;
   } catch (error) {
@@ -299,26 +340,314 @@ export async function findUserByEmail(email: string) {
   }
 }
 
-export async function resetUserPasswordByEmail(email: string, newPassword: string) {
+/**
+ * Initiates a password recovery flow using a single-use, short-lived cryptographic token.
+ * Stores only the SHA-256 hash of the token in the database, invalidates prior unconsumed tokens
+ * for the account, and returns a uniform enumeration-safe message.
+ */
+export async function requestPasswordRecoveryToken(
+  email: string,
+  options?: { returnTokenForTesting?: boolean }
+): Promise<{
+  accepted: true;
+  message: string;
+  expiresInMinutes: number;
+  _testRecoveryToken?: string;
+}> {
   try {
-    const user = await findUserByEmail(email);
-    if (!user) {
-      throw new Error('No registered account found for that email address.');
+    const normalizedEmail = String(email || '').toLowerCase().trim();
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      throw new ClientSafeError('Please provide a valid email address.', 400);
     }
+
+    const user = await findUserByEmail(normalizedEmail);
+    if (!user) {
+      return {
+        accepted: true,
+        message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
+        expiresInMinutes: 15,
+      };
+    }
+
+    const { rawToken, tokenHash, expiresAt } = generateRecoveryToken();
+    const now = new Date();
+
+    await db.transaction(async (tx) => {
+      // Invalidate any previous unconsumed recovery tokens for this user
+      await tx
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.userUid, user.uid),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        );
+
+      await tx.insert(passwordResetTokens).values({
+        userUid: user.uid,
+        tokenHash,
+        expiresAt,
+      });
+    });
+
+    // Optional external email webhook delivery when configured in deployment environment
+    const webhookUrl = process.env.PASSWORD_RESET_WEBHOOK_URL?.trim();
+    if (webhookUrl) {
+      try {
+        await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            to: user.email,
+            displayName: user.displayName,
+            expiresAt: expiresAt.toISOString(),
+            resetToken: rawToken,
+          }),
+        });
+      } catch (deliveryErr) {
+        console.error('Password recovery webhook delivery failed:', deliveryErr);
+      }
+    }
+
+    const response: {
+      accepted: true;
+      message: string;
+      expiresInMinutes: number;
+      _testRecoveryToken?: string;
+    } = {
+      accepted: true,
+      message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
+      expiresInMinutes: 15,
+    };
+
+    if (options?.returnTokenForTesting && process.env.NODE_ENV === 'test') {
+      response._testRecoveryToken = rawToken;
+    }
+
+    return response;
+  } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error requesting password recovery token:', error);
+    throw new Error('Failed to process password recovery request.', { cause: error });
+  }
+}
+
+/**
+ * Verifies and atomically consumes a single-use password recovery token,
+ * updates the user's password hash, and increments tokenVersion to revoke prior sessions.
+ */
+export async function confirmPasswordRecoveryToken(
+  rawToken: string,
+  newPassword: string
+) {
+  try {
+    const cleanedToken = String(rawToken || '').trim();
+    if (!cleanedToken || cleanedToken.length < 32) {
+      throw new ClientSafeError(
+        'Invalid or expired password recovery token.',
+        400
+      );
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      throw new ClientSafeError(
+        'New password must be at least 8 characters long.',
+        400
+      );
+    }
+
+    const tokenHash = hashRecoveryToken(cleanedToken);
+    const now = new Date();
+    const newPasswordHash = hashPassword(newPassword);
+
+    const updatedUser = await db.transaction(async (tx) => {
+      const tokenRows = await tx
+        .select()
+        .from(passwordResetTokens)
+        .where(eq(passwordResetTokens.tokenHash, tokenHash));
+
+      const tokenRecord = tokenRows[0];
+      if (
+        !tokenRecord ||
+        tokenRecord.consumedAt !== null ||
+        new Date(tokenRecord.expiresAt).getTime() <= now.getTime()
+      ) {
+        throw new ClientSafeError(
+          'Invalid, expired, or already used password recovery token.',
+          400
+        );
+      }
+
+      // Atomic conditional consumption so concurrent requests with the same token cannot both succeed
+      const consumedRows = await tx
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.id, tokenRecord.id),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        )
+        .returning();
+
+      if (consumedRows.length === 0) {
+        throw new ClientSafeError(
+          'Invalid, expired, or already used password recovery token.',
+          400
+        );
+      }
+
+      // Invalidate any other outstanding recovery tokens for this user
+      await tx
+        .update(passwordResetTokens)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(passwordResetTokens.userUid, tokenRecord.userUid),
+            isNull(passwordResetTokens.consumedAt)
+          )
+        );
+
+      const userRows = await tx
+        .select()
+        .from(users)
+        .where(eq(users.uid, tokenRecord.userUid));
+      const targetUser = userRows[0];
+
+      if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
+        throw new ClientSafeError('Account is no longer active.', 400);
+      }
+
+      const nextProvider =
+        targetUser.authProvider === 'firebase' ? 'both' : targetUser.authProvider;
+
+      const [updated] = await tx
+        .update(users)
+        .set({
+          passwordHash: newPasswordHash,
+          authProvider: nextProvider,
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: now,
+        })
+        .where(eq(users.uid, targetUser.uid))
+        .returning();
+
+      return updated;
+    });
+
+    return sanitizeUserForClient(updatedUser);
+  } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error confirming password recovery token:', error);
+    throw new Error('Failed to reset password.', { cause: error });
+  }
+}
+
+/**
+ * Allows an authenticated user to change their existing password after verifying their current password.
+ * Increments tokenVersion to invalidate older sessions.
+ */
+export async function changeAuthenticatedUserPassword(
+  uid: string,
+  currentPassword: string,
+  newPassword: string
+) {
+  try {
+    if (!currentPassword || typeof currentPassword !== 'string') {
+      throw new ClientSafeError('Current password is required.', 400);
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      throw new ClientSafeError('New password must be at least 8 characters long.', 400);
+    }
+
+    const rows = await db.select().from(users).where(eq(users.uid, uid));
+    const user = rows[0];
+    if (!user || user.accountStatus !== 'active') {
+      throw new ClientSafeError('Account not found.', 404);
+    }
+    if (!user.passwordHash) {
+      throw new ClientSafeError(
+        'This account does not have a local password set yet. Use the link-password endpoint instead.',
+        400
+      );
+    }
+    if (!verifyPassword(currentPassword, user.passwordHash)) {
+      throw new ClientSafeError('Current password is incorrect.', 401);
+    }
+
     const [updated] = await db
       .update(users)
       .set({
         passwordHash: hashPassword(newPassword),
+        tokenVersion: sql`${users.tokenVersion} + 1`,
         updatedAt: new Date(),
       })
-      .where(eq(users.uid, user.uid))
+      .where(eq(users.uid, uid))
       .returning();
+
     return updated;
-  } catch (error: any) {
-    if (error.message?.includes('No registered account')) throw error;
-    console.error('Error resetting password:', error);
-    throw new Error('Failed to update password.', { cause: error });
+  } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error changing password:', error);
+    throw new Error('Failed to change password.', { cause: error });
   }
+}
+
+/**
+ * Allows an already-authenticated provider user (without a local password) to attach a local password
+ * after proving account ownership via an authenticated session.
+ */
+export async function linkPasswordToAuthenticatedAccount(
+  uid: string,
+  newPassword: string
+) {
+  try {
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      throw new ClientSafeError('Password must be at least 8 characters long.', 400);
+    }
+
+    const rows = await db.select().from(users).where(eq(users.uid, uid));
+    const user = rows[0];
+    if (!user || user.accountStatus !== 'active') {
+      throw new ClientSafeError('Account not found.', 404);
+    }
+    if (user.passwordHash) {
+      throw new ClientSafeError(
+        'A password is already configured for this account. Use change-password with your current password.',
+        409
+      );
+    }
+
+    const [updated] = await db
+      .update(users)
+      .set({
+        passwordHash: hashPassword(newPassword),
+        authProvider: 'both',
+        tokenVersion: sql`${users.tokenVersion} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.uid, uid))
+      .returning();
+
+    return updated;
+  } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error linking password to account:', error);
+    throw new Error('Failed to link password to account.', { cause: error });
+  }
+}
+
+/**
+ * Increments a user's tokenVersion to immediately revoke all existing local session tokens.
+ */
+export async function revokeUserSessions(uid: string) {
+  await db
+    .update(users)
+    .set({
+      tokenVersion: sql`${users.tokenVersion} + 1`,
+      updatedAt: new Date(),
+    })
+    .where(eq(users.uid, uid));
 }
 
 export async function updateUserProfile(
@@ -341,22 +670,62 @@ export async function updateUserProfile(
       .set(setData)
       .where(eq(users.uid, uid))
       .returning();
+    if (!updated) {
+      throw new ClientSafeError('User account not found.', 404);
+    }
     return updated;
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error updating user profile:', error);
     throw new Error('Failed to update user profile.', { cause: error });
   }
 }
 
+/**
+ * Deletes a user account atomically inside a database transaction, records a tombstone
+ * in deleted_accounts so existing tokens are immediately rejected and cannot resurrect the user,
+ * and revokes Firebase refresh tokens best-effort.
+ */
 export async function deleteUserAccount(uid: string) {
   try {
-    // Delete all private records belonging to this student
-    await db.delete(bookmarks).where(eq(bookmarks.userUid, uid));
-    await db.delete(questionAttempts).where(eq(questionAttempts.userUid, uid));
-    await db.delete(examSessions).where(eq(examSessions.userUid, uid));
-    await db.delete(users).where(eq(users.uid, uid));
+    await db.transaction(async (tx) => {
+      const existing = await tx.select().from(users).where(eq(users.uid, uid));
+      const user = existing[0];
+      const emailHash = user
+        ? hashEmailForTombstone(user.email)
+        : hashEmailForTombstone(uid);
+
+      await tx
+        .insert(deletedAccounts)
+        .values({
+          uid,
+          emailHash,
+          deletedAt: new Date(),
+        })
+        .onConflictDoNothing();
+
+      await tx
+        .delete(passwordResetTokens)
+        .where(eq(passwordResetTokens.userUid, uid));
+      await tx.delete(bookmarks).where(eq(bookmarks.userUid, uid));
+      await tx
+        .delete(questionAttempts)
+        .where(eq(questionAttempts.userUid, uid));
+      await tx.delete(examSessions).where(eq(examSessions.userUid, uid));
+      await tx.delete(users).where(eq(users.uid, uid));
+    });
+
+    if (!uid.startsWith('usr_')) {
+      try {
+        await adminAuth.revokeRefreshTokens(uid);
+      } catch {
+        // Ignore if user does not exist in Firebase Auth or admin credentials are not configured for revocation
+      }
+    }
+
     return { deleted: true };
   } catch (error) {
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error deleting user account:', error);
     throw new Error('Failed to delete account records.', { cause: error });
   }
@@ -471,6 +840,58 @@ export interface SessionOrderItem {
   submitted: boolean;
 }
 
+export interface ServerExamDeadlineStatus {
+  serverElapsedSeconds: number;
+  remainingSeconds: number | null;
+  isExpired: boolean;
+  isPastSubmissionGrace: boolean;
+  effectiveElapsedSeconds: number;
+}
+
+/**
+ * Pure server-side exam deadline evaluator.
+ * Never trusts client-supplied elapsedSeconds for timed exam enforcement.
+ */
+export function evaluateServerExamDeadline(params: {
+  mode: string;
+  startedAt: Date | string;
+  timeLimitSeconds: number | null;
+  nowMs?: number;
+  graceSeconds?: number;
+}): ServerExamDeadlineStatus {
+  const nowMs = params.nowMs ?? Date.now();
+  const startedMs = new Date(params.startedAt).getTime();
+  const serverElapsedSeconds = Math.max(
+    0,
+    Math.floor((nowMs - (Number.isFinite(startedMs) ? startedMs : nowMs)) / 1000)
+  );
+
+  if (params.timeLimitSeconds === null || params.mode !== 'exam') {
+    return {
+      serverElapsedSeconds,
+      remainingSeconds: null,
+      isExpired: false,
+      isPastSubmissionGrace: false,
+      effectiveElapsedSeconds: Math.max(1, serverElapsedSeconds),
+    };
+  }
+
+  const limit = Math.max(1, params.timeLimitSeconds);
+  const grace = Math.max(0, params.graceSeconds ?? EXAM_SUBMISSION_GRACE_SECONDS);
+  const remainingSeconds = Math.max(0, limit - serverElapsedSeconds);
+  const isExpired = serverElapsedSeconds > limit;
+  const isPastSubmissionGrace = serverElapsedSeconds > limit + grace;
+  const effectiveElapsedSeconds = Math.min(limit, Math.max(1, serverElapsedSeconds));
+
+  return {
+    serverElapsedSeconds,
+    remainingSeconds,
+    isExpired,
+    isPastSubmissionGrace,
+    effectiveElapsedSeconds,
+  };
+}
+
 /**
  * Starts a new Study, Exam, or Custom Practice session for a specific authenticated student.
  */
@@ -537,8 +958,9 @@ export async function createPracticeOrExamSession(
     });
 
     if (selection.selectedQuestions.length === 0) {
-      throw new Error(
-        selection.shortfallNotice || 'No published questions match your selected filters.'
+      throw new ClientSafeError(
+        selection.shortfallNotice || 'No published questions match your selected filters.',
+        400
       );
     }
 
@@ -574,7 +996,14 @@ export async function createPracticeOrExamSession(
 
     const timeLimitSeconds =
       params.mode === 'exam'
-        ? (params.timeLimitMinutes ?? Math.max(5, selection.selectedQuestions.length * 2)) * 60
+        ? Math.max(
+            60,
+            Math.min(
+              60 * 240,
+              (params.timeLimitMinutes ??
+                Math.max(5, selection.selectedQuestions.length * 2)) * 60
+            )
+          )
         : null;
 
     const [createdSession] = await db
@@ -603,7 +1032,7 @@ export async function createPracticeOrExamSession(
       shortfallNotice: selection.shortfallNotice,
     };
   } catch (error: any) {
-    if (error.message?.includes('No published questions')) throw error;
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error creating practice/exam session:', error);
     throw new Error('Failed to start question session.', { cause: error });
   }
@@ -622,7 +1051,10 @@ export async function getExamSessionForStudent(userUid: string, sessionId: numbe
       .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
 
     if (rows.length === 0) {
-      throw new Error('Forbidden or not found: Exam session does not belong to this account.');
+      throw new ClientSafeError(
+        'Forbidden or not found: Exam session does not belong to this account.',
+        403
+      );
     }
 
     const session = rows[0];
@@ -720,18 +1152,19 @@ export async function getExamSessionForStudent(userUid: string, sessionId: numbe
       })
       .filter(Boolean);
 
-    // Server-side remaining timer calculation for Exam Mode
-    let remainingSeconds: number | null = null;
-    if (session.timeLimitSeconds !== null) {
-      if (session.status === 'completed') {
-        remainingSeconds = Math.max(0, session.timeLimitSeconds - session.elapsedSeconds);
-      } else {
-        const serverElapsed = Math.floor(
-          (Date.now() - new Date(session.startedAt).getTime()) / 1000
-        );
-        remainingSeconds = Math.max(0, session.timeLimitSeconds - serverElapsed);
-      }
-    }
+    // Authoritative server-side remaining timer calculation for Exam Mode
+    const deadlineStatus = evaluateServerExamDeadline({
+      mode: session.mode,
+      startedAt: session.startedAt,
+      timeLimitSeconds: session.timeLimitSeconds,
+    });
+
+    const remainingSeconds =
+      session.timeLimitSeconds !== null
+        ? session.status === 'completed'
+          ? Math.max(0, session.timeLimitSeconds - session.elapsedSeconds)
+          : deadlineStatus.remainingSeconds
+        : null;
 
     return {
       id: session.id,
@@ -746,15 +1179,19 @@ export async function getExamSessionForStudent(userUid: string, sessionId: numbe
       unansweredCount: session.unansweredCount,
       scorePercentage: session.scorePercentage,
       timeLimitSeconds: session.timeLimitSeconds,
-      elapsedSeconds: session.elapsedSeconds,
+      elapsedSeconds:
+        session.status === 'completed'
+          ? session.elapsedSeconds
+          : deadlineStatus.serverElapsedSeconds,
       remainingSeconds,
+      isExpired: session.status === 'in_progress' ? deadlineStatus.isExpired : false,
       shuffleOptions: session.shuffleOptions,
       startedAt: session.startedAt,
       completedAt: session.completedAt,
       questions: formattedQuestions,
     };
   } catch (error: any) {
-    if (error.message?.includes('Forbidden or not found')) throw error;
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error loading exam session:', error);
     throw new Error('Failed to load exam session.', { cause: error });
   }
@@ -762,8 +1199,7 @@ export async function getExamSessionForStudent(userUid: string, sessionId: numbe
 
 /**
  * Records an answer selection for a single question inside a session.
- * In Study/Custom mode, submitting immediately reveals feedback for that question.
- * In Exam mode, records the selected choice without revealing the answer.
+ * Strictly enforces server-side exam deadlines and prevents modifying locked answers.
  */
 export async function saveSessionQuestionAnswer(
   userUid: string,
@@ -771,32 +1207,62 @@ export async function saveSessionQuestionAnswer(
   questionId: number,
   displayedOption: OptionKey | null,
   lockAnswer: boolean,
-  elapsedSeconds?: number
+  _clientElapsedSeconds?: number
 ) {
   try {
+    if (
+      displayedOption !== null &&
+      displayedOption !== undefined &&
+      !OPTION_KEYS.includes(displayedOption)
+    ) {
+      throw new ClientSafeError('Invalid answer option. Must be A, B, C, D, or null.', 400);
+    }
+
     const rows = await db
       .select()
       .from(examSessions)
       .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
 
     if (rows.length === 0) {
-      throw new Error('Forbidden: Session not found for this user.');
+      throw new ClientSafeError('Forbidden: Session not found for this user.', 403);
     }
 
     const session = rows[0];
-    if (session.status === 'completed') {
-      return getExamSessionForStudent(userUid, sessionId);
+    if (session.status !== 'in_progress') {
+      throw new ClientSafeError(
+        'Cannot modify answers for a session that is already completed.',
+        409
+      );
+    }
+
+    const deadlineStatus = evaluateServerExamDeadline({
+      mode: session.mode,
+      startedAt: session.startedAt,
+      timeLimitSeconds: session.timeLimitSeconds,
+    });
+
+    if (deadlineStatus.isExpired) {
+      throw new ClientSafeError(
+        'Exam time limit has expired. Further answer modifications are not allowed.',
+        409
+      );
     }
 
     const orderItems: SessionOrderItem[] = JSON.parse(session.questionOrderJson || '[]');
     const targetItem = orderItems.find((item) => item.questionId === questionId);
     if (!targetItem) {
-      throw new Error('Question does not belong to this session.');
+      throw new ClientSafeError('Question does not belong to this session.', 400);
     }
 
-    targetItem.selectedDisplayed = displayedOption;
+    // In Study or Custom mode, once a question is locked/submitted and its explanation revealed,
+    // prevent overwriting the submitted answer.
+    if (session.mode !== 'exam' && targetItem.submitted) {
+      return getExamSessionForStudent(userUid, sessionId);
+    }
+
+    targetItem.selectedDisplayed = displayedOption ?? null;
     targetItem.selectedCanonical = resolveCanonicalOption(
-      displayedOption,
+      displayedOption ?? null,
       targetItem.permutation
     );
     if (lockAnswer) {
@@ -807,165 +1273,225 @@ export async function saveSessionQuestionAnswer(
       .update(examSessions)
       .set({
         questionOrderJson: JSON.stringify(orderItems),
-        elapsedSeconds:
-          typeof elapsedSeconds === 'number'
-            ? Math.max(session.elapsedSeconds, elapsedSeconds)
-            : session.elapsedSeconds,
+        elapsedSeconds: Math.max(
+          session.elapsedSeconds,
+          deadlineStatus.effectiveElapsedSeconds
+        ),
       })
-      .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
+      .where(
+        and(
+          eq(examSessions.id, sessionId),
+          eq(examSessions.userUid, userUid),
+          eq(examSessions.status, 'in_progress')
+        )
+      );
 
     return getExamSessionForStudent(userUid, sessionId);
   } catch (error: any) {
-    if (error.message?.includes('Forbidden')) throw error;
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error saving question answer:', error);
     throw new Error('Failed to save question response.', { cause: error });
   }
 }
 
 /**
- * Completes and grades an Exam or Study session idempotently.
- * Prevents duplicate attempt insertions if submitted twice, and records immutable snapshots
- * of each question so future admin edits do not alter historical student scores.
+ * Completes and grades an Exam or Study session atomically and idempotently inside a PostgreSQL transaction.
+ * - Acquires a row-level lock (FOR UPDATE) on the session row so concurrent completion requests cannot race.
+ * - Computes authoritative elapsed time from server timestamps (never trusting manipulated clientElapsedSeconds).
+ * - Rejects post-deadline answer modifications in timed Exam Mode.
+ * - Uses unique index protection on (session_id, question_id) in question_attempts.
  */
 export async function completeExamSession(
   userUid: string,
   sessionId: number,
   finalDisplayedAnswers?: Record<number, OptionKey | null>,
-  clientElapsedSeconds?: number
+  _clientElapsedSeconds?: number
 ) {
   try {
-    const rows = await db
-      .select()
-      .from(examSessions)
-      .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
-
-    if (rows.length === 0) {
-      throw new Error('Forbidden: Session not found for this user.');
-    }
-
-    const session = rows[0];
-    // Idempotency guard: if already completed, return the completed session without duplicating attempts!
-    if (session.status === 'completed') {
-      return getExamSessionForStudent(userUid, sessionId);
-    }
-
-    const orderItems: SessionOrderItem[] = JSON.parse(session.questionOrderJson || '[]');
-    if (finalDisplayedAnswers) {
-      for (const item of orderItems) {
-        if (item.questionId in finalDisplayedAnswers) {
-          const disp = finalDisplayedAnswers[item.questionId];
-          item.selectedDisplayed = disp;
-          item.selectedCanonical = resolveCanonicalOption(disp, item.permutation);
-        }
-        item.submitted = true;
-      }
-    } else {
-      for (const item of orderItems) {
-        item.submitted = true;
-      }
-    }
-
-    const qIds = orderItems.map((i) => i.questionId);
-    const dbQuestions =
-      qIds.length > 0
-        ? await db.select().from(questions).where(inArray(questions.id, qIds))
-        : [];
-    const allSubjects = await db.select().from(subjects);
-    const allLectures = await db.select().from(lectures);
-
-    const qMap = new Map(dbQuestions.map((q) => [q.id, q]));
-    const sMap = new Map(allSubjects.map((s) => [s.id, s.title]));
-    const lMap = new Map(allLectures.map((l) => [l.id, l.title]));
-
-    const canonicalAnswersMap: Record<number, OptionKey | null> = {};
-    const questionsForScoring: Array<{ id: number; correctAnswer: OptionKey }> = [];
-
-    for (const item of orderItems) {
-      const q = qMap.get(item.questionId);
-      if (q) {
-        questionsForScoring.push({
-          id: q.id,
-          correctAnswer: q.correctAnswer as OptionKey,
-        });
-        canonicalAnswersMap[q.id] = item.selectedCanonical;
-      }
-    }
-
-    const score = scoreExamSession(questionsForScoring, canonicalAnswersMap);
-    const serverElapsed = Math.max(
-      1,
-      Math.floor((Date.now() - new Date(session.startedAt).getTime()) / 1000)
-    );
-    const finalElapsed =
-      session.timeLimitSeconds !== null
-        ? Math.min(session.timeLimitSeconds, clientElapsedSeconds || serverElapsed)
-        : clientElapsedSeconds || serverElapsed;
-
-    await db
-      .update(examSessions)
-      .set({
-        status: 'completed',
-        correctCount: score.correctCount,
-        incorrectCount: score.incorrectCount,
-        unansweredCount: score.unansweredCount,
-        scorePercentage: score.scorePercentage,
-        elapsedSeconds: finalElapsed,
-        questionOrderJson: JSON.stringify(orderItems),
-        completedAt: new Date(),
-      })
-      .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
-
-    // Remove any partial attempt rows for this sessionId before inserting the finalized set
-    await db
-      .delete(questionAttempts)
-      .where(
-        and(eq(questionAttempts.sessionId, sessionId), eq(questionAttempts.userUid, userUid))
+    await db.transaction(async (tx) => {
+      // Acquire row-level lock on the exam session row to serialize concurrent completion calls
+      await tx.execute(
+        sql`SELECT id, status FROM exam_sessions WHERE id = ${sessionId} AND user_uid = ${userUid} FOR UPDATE`
       );
 
-    const avgTimePerQ =
-      score.totalQuestions > 0 ? Math.round(finalElapsed / score.totalQuestions) : 0;
+      const rows = await tx
+        .select()
+        .from(examSessions)
+        .where(and(eq(examSessions.id, sessionId), eq(examSessions.userUid, userUid)));
 
-    for (const res of score.questionResults) {
-      const q = qMap.get(res.questionId);
-      if (!q) continue;
+      if (rows.length === 0) {
+        throw new ClientSafeError('Forbidden: Session not found for this user.', 403);
+      }
 
-      const snapshotJson = JSON.stringify({
-        id: q.id,
-        subjectTitle: sMap.get(q.subjectId) || 'Medical Subject',
-        lectureTitle: lMap.get(q.lectureId) || 'Lecture',
-        questionText: q.questionText,
-        optionA: q.optionA,
-        optionB: q.optionB,
-        optionC: q.optionC,
-        optionD: q.optionD,
-        correctAnswer: q.correctAnswer,
-        explanation: q.explanation,
-        explanationA: q.explanationA,
-        explanationB: q.explanationB,
-        explanationC: q.explanationC,
-        explanationD: q.explanationD,
-        difficulty: q.difficulty,
-        tags: q.tags,
-        version: q.version,
+      const session = rows[0];
+      if (session.status === 'completed') {
+        return;
+      }
+
+      const deadlineStatus = evaluateServerExamDeadline({
+        mode: session.mode,
+        startedAt: session.startedAt,
+        timeLimitSeconds: session.timeLimitSeconds,
       });
 
-      await db.insert(questionAttempts).values({
-        sessionId,
-        userUid,
-        questionId: q.id,
-        subjectId: q.subjectId,
-        lectureId: q.lectureId,
-        selectedOption: res.selectedCanonical,
-        correctOptionSnapshot: res.correctCanonical,
-        isCorrect: res.isCorrect,
-        questionSnapshotJson: snapshotJson,
-        timeSpentSeconds: avgTimePerQ,
-      });
-    }
+      const orderItems: SessionOrderItem[] = JSON.parse(session.questionOrderJson || '[]');
+
+      if (finalDisplayedAnswers && typeof finalDisplayedAnswers === 'object') {
+        // Check if client is attempting to alter answers after the server deadline expired
+        if (deadlineStatus.isExpired) {
+          let attemptedPostExpiryMutation = false;
+          for (const item of orderItems) {
+            if (item.questionId in finalDisplayedAnswers) {
+              const disp = finalDisplayedAnswers[item.questionId] ?? null;
+              if (disp !== item.selectedDisplayed) {
+                attemptedPostExpiryMutation = true;
+                break;
+              }
+            }
+          }
+          if (attemptedPostExpiryMutation && deadlineStatus.isPastSubmissionGrace) {
+            throw new ClientSafeError(
+              'Exam deadline has expired. Late answer modifications were rejected.',
+              409
+            );
+          }
+          // Even within auto-submit grace, if the deadline has passed, grade only answers already saved before expiry
+          for (const item of orderItems) {
+            item.submitted = true;
+          }
+        } else {
+          for (const item of orderItems) {
+            if (item.questionId in finalDisplayedAnswers) {
+              const rawDisp = finalDisplayedAnswers[item.questionId];
+              const validDisp =
+                rawDisp && OPTION_KEYS.includes(rawDisp) ? rawDisp : null;
+              item.selectedDisplayed = validDisp;
+              item.selectedCanonical = resolveCanonicalOption(
+                validDisp,
+                item.permutation
+              );
+            }
+            item.submitted = true;
+          }
+        }
+      } else {
+        for (const item of orderItems) {
+          item.submitted = true;
+        }
+      }
+
+      const qIds = orderItems.map((i) => i.questionId);
+      const dbQuestions =
+        qIds.length > 0
+          ? await tx.select().from(questions).where(inArray(questions.id, qIds))
+          : [];
+      const allSubjects = await tx.select().from(subjects);
+      const allLectures = await tx.select().from(lectures);
+
+      const qMap = new Map(dbQuestions.map((q) => [q.id, q]));
+      const sMap = new Map(allSubjects.map((s) => [s.id, s.title]));
+      const lMap = new Map(allLectures.map((l) => [l.id, l.title]));
+
+      const canonicalAnswersMap: Record<number, OptionKey | null> = {};
+      const questionsForScoring: Array<{ id: number; correctAnswer: OptionKey }> = [];
+
+      for (const item of orderItems) {
+        const q = qMap.get(item.questionId);
+        if (q) {
+          questionsForScoring.push({
+            id: q.id,
+            correctAnswer: q.correctAnswer as OptionKey,
+          });
+          canonicalAnswersMap[q.id] = item.selectedCanonical;
+        }
+      }
+
+      const score = scoreExamSession(questionsForScoring, canonicalAnswersMap);
+      const finalElapsed = deadlineStatus.effectiveElapsedSeconds;
+
+      // Conditional status transition from 'in_progress' -> 'completed'
+      const updatedSessions = await tx
+        .update(examSessions)
+        .set({
+          status: 'completed',
+          correctCount: score.correctCount,
+          incorrectCount: score.incorrectCount,
+          unansweredCount: score.unansweredCount,
+          scorePercentage: score.scorePercentage,
+          elapsedSeconds: finalElapsed,
+          questionOrderJson: JSON.stringify(orderItems),
+          completedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(examSessions.id, sessionId),
+            eq(examSessions.userUid, userUid),
+            eq(examSessions.status, 'in_progress')
+          )
+        )
+        .returning();
+
+      if (updatedSessions.length === 0) {
+        return;
+      }
+
+      await tx
+        .delete(questionAttempts)
+        .where(
+          and(
+            eq(questionAttempts.sessionId, sessionId),
+            eq(questionAttempts.userUid, userUid)
+          )
+        );
+
+      const avgTimePerQ =
+        score.totalQuestions > 0 ? Math.round(finalElapsed / score.totalQuestions) : 0;
+
+      for (const res of score.questionResults) {
+        const q = qMap.get(res.questionId);
+        if (!q) continue;
+
+        const snapshotJson = JSON.stringify({
+          id: q.id,
+          subjectTitle: sMap.get(q.subjectId) || 'Medical Subject',
+          lectureTitle: lMap.get(q.lectureId) || 'Lecture',
+          questionText: q.questionText,
+          optionA: q.optionA,
+          optionB: q.optionB,
+          optionC: q.optionC,
+          optionD: q.optionD,
+          correctAnswer: q.correctAnswer,
+          explanation: q.explanation,
+          explanationA: q.explanationA,
+          explanationB: q.explanationB,
+          explanationC: q.explanationC,
+          explanationD: q.explanationD,
+          difficulty: q.difficulty,
+          tags: q.tags,
+          version: q.version,
+        });
+
+        await tx
+          .insert(questionAttempts)
+          .values({
+            sessionId,
+            userUid,
+            questionId: q.id,
+            subjectId: q.subjectId,
+            lectureId: q.lectureId,
+            selectedOption: res.selectedCanonical,
+            correctOptionSnapshot: res.correctCanonical,
+            isCorrect: res.isCorrect,
+            questionSnapshotJson: snapshotJson,
+            timeSpentSeconds: avgTimePerQ,
+          })
+          .onConflictDoNothing();
+      }
+    });
 
     return getExamSessionForStudent(userUid, sessionId);
   } catch (error: any) {
-    if (error.message?.includes('Forbidden')) throw error;
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error completing exam session:', error);
     throw new Error('Failed to submit and grade exam session.', { cause: error });
   }
@@ -1372,16 +1898,32 @@ export async function getAdminDashboardData() {
         totalQuestions: allQuestions.length,
         completedExamsCount: recentSessions.filter((s) => s.status === 'completed').length,
       },
-      subjects: allSubjects,
+      subjects: allSubjects.map((s) => ({
+        ...s,
+        lectureCount: allLectures.filter((l) => l.subjectId === s.id).length,
+        questionCount: allQuestions.filter((q) => q.subjectId === s.id).length,
+      })),
       lectures: allLectures.map((l) => ({
         ...l,
         subjectTitle: sMap.get(l.subjectId) || 'Unknown Subject',
+        questionCount: allQuestions.filter((q) => q.lectureId === l.id).length,
       })),
-      questionBanks: allBanks,
+      questionBanks: allBanks.map((b) => ({
+        ...b,
+        subjectTitle: sMap.get(b.subjectId) || 'Unknown Subject',
+        lectureTitle: b.lectureId ? lMap.get(b.lectureId) || 'Unknown Lecture' : 'All Lectures',
+        questionCount: allQuestions.filter(
+          (q) => q.questionBankId === b.id || (b.lectureId && q.lectureId === b.lectureId)
+        ).length,
+      })),
       questions: allQuestions.map((q) => ({
         ...q,
         subjectTitle: sMap.get(q.subjectId) || 'Unknown Subject',
         lectureTitle: lMap.get(q.lectureId) || 'Unknown Lecture',
+      })),
+      users: allUsers.map(({ passwordHash: _ph, ...u }) => ({
+        ...u,
+        isOwner: isOwnerAdminEmail(u.email),
       })),
       recentActivity: recentSessions,
       recentImports,
@@ -1501,27 +2043,31 @@ export async function upsertLectureAdmin(
       return updated;
     }
 
-    const [created] = await db
-      .insert(lectures)
-      .values({
-        subjectId: Number(payload.subjectId),
-        title: payload.title.trim(),
-        description: payload.description.trim(),
-        lectureNumber: Number(payload.lectureNumber) || 1,
-        educationalNotes: payload.educationalNotes?.trim() || '',
-        estimatedMinutes: Number(payload.estimatedMinutes) || 30,
-        status: payload.status || 'published',
-      })
-      .returning();
+    const created = await db.transaction(async (tx) => {
+      const [insertedLecture] = await tx
+        .insert(lectures)
+        .values({
+          subjectId: Number(payload.subjectId),
+          title: payload.title.trim(),
+          description: payload.description.trim(),
+          lectureNumber: Number(payload.lectureNumber) || 1,
+          educationalNotes: payload.educationalNotes?.trim() || '',
+          estimatedMinutes: Number(payload.estimatedMinutes) || 30,
+          status: payload.status || 'published',
+        })
+        .returning();
 
-    // Automatically create a default Practice Question Bank for the new lecture
-    await db.insert(questionBanks).values({
-      subjectId: created.subjectId,
-      lectureId: created.id,
-      title: `${created.title} — Practice Bank`,
-      description: `Formative practice bank for ${created.title}.`,
-      bankType: 'practice',
-      status: 'published',
+      // Automatically create a default Practice Question Bank for the new lecture
+      await tx.insert(questionBanks).values({
+        subjectId: insertedLecture.subjectId,
+        lectureId: insertedLecture.id,
+        title: `${insertedLecture.title} — Practice Bank`,
+        description: `Formative practice bank for ${insertedLecture.title}.`,
+        bankType: 'practice',
+        status: 'published',
+      });
+
+      return insertedLecture;
     });
 
     await logAdminAction(
@@ -1650,57 +2196,347 @@ export async function upsertQuestionAdmin(
 }
 
 /**
- * Safe archival or deletion of a question:
- * If the question has already been used in student attempts, archives it instead of destroying historical records!
+ * Permanently deletes a Subject and all its Lectures, Question Banks (Quizzes),
+ * Questions, Bookmarks, Question Attempts, and Exam Sessions atomically.
+ */
+export async function deleteSubjectAdmin(
+  admin: { uid: string; email: string },
+  subjectId: number
+) {
+  try {
+    const { title, qCount } = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(subjects)
+        .where(eq(subjects.id, subjectId));
+      const subjTitle = existing[0]?.title || `Subject #${subjectId}`;
+
+      const subjectQuestions = await tx
+        .select({ id: questions.id })
+        .from(questions)
+        .where(eq(questions.subjectId, subjectId));
+      const qIds = subjectQuestions.map((q) => q.id);
+
+      if (qIds.length > 0) {
+        await tx.delete(bookmarks).where(inArray(bookmarks.questionId, qIds));
+        await tx
+          .delete(questionAttempts)
+          .where(inArray(questionAttempts.questionId, qIds));
+      }
+
+      await tx
+        .delete(questionAttempts)
+        .where(eq(questionAttempts.subjectId, subjectId));
+      await tx.delete(examSessions).where(eq(examSessions.subjectId, subjectId));
+      await tx.delete(questions).where(eq(questions.subjectId, subjectId));
+      await tx.delete(questionBanks).where(eq(questionBanks.subjectId, subjectId));
+      await tx.delete(lectures).where(eq(lectures.subjectId, subjectId));
+      await tx.delete(subjects).where(eq(subjects.id, subjectId));
+
+      return { title: subjTitle, qCount: qIds.length };
+    });
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'DELETE_SUBJECT',
+      'subject',
+      subjectId,
+      `Permanently deleted subject "${title}" and all its lectures, quizzes, and ${qCount} question(s).`
+    );
+
+    return {
+      action: 'deleted',
+      message: `Subject "${title}" and all associated lectures, quizzes, and questions were permanently deleted.`,
+    };
+  } catch (error) {
+    console.error('Error deleting subject:', error);
+    throw new Error('Failed to delete subject.', { cause: error });
+  }
+}
+
+/**
+ * Permanently deletes a Lecture and all its Question Banks (Quizzes),
+ * Questions, Bookmarks, Question Attempts, and Exam Sessions atomically.
+ */
+export async function deleteLectureAdmin(
+  admin: { uid: string; email: string },
+  lectureId: number
+) {
+  try {
+    const { title, qCount } = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(lectures)
+        .where(eq(lectures.id, lectureId));
+      const lectTitle = existing[0]?.title || `Lecture #${lectureId}`;
+
+      const lectureQuestions = await tx
+        .select({ id: questions.id })
+        .from(questions)
+        .where(eq(questions.lectureId, lectureId));
+      const qIds = lectureQuestions.map((q) => q.id);
+
+      if (qIds.length > 0) {
+        await tx.delete(bookmarks).where(inArray(bookmarks.questionId, qIds));
+        await tx
+          .delete(questionAttempts)
+          .where(inArray(questionAttempts.questionId, qIds));
+      }
+
+      await tx
+        .delete(questionAttempts)
+        .where(eq(questionAttempts.lectureId, lectureId));
+      await tx.delete(examSessions).where(eq(examSessions.lectureId, lectureId));
+      await tx.delete(questions).where(eq(questions.lectureId, lectureId));
+      await tx.delete(questionBanks).where(eq(questionBanks.lectureId, lectureId));
+      await tx.delete(lectures).where(eq(lectures.id, lectureId));
+
+      return { title: lectTitle, qCount: qIds.length };
+    });
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'DELETE_LECTURE',
+      'lecture',
+      lectureId,
+      `Permanently deleted lecture "${title}" and all its quizzes and ${qCount} question(s).`
+    );
+
+    return {
+      action: 'deleted',
+      message: `Lecture "${title}" and all associated quizzes and questions were permanently deleted.`,
+    };
+  } catch (error) {
+    console.error('Error deleting lecture:', error);
+    throw new Error('Failed to delete lecture.', { cause: error });
+  }
+}
+
+/**
+ * Permanently deletes a Question Bank (Quiz) and its associated questions atomically.
+ */
+export async function deleteQuestionBankAdmin(
+  admin: { uid: string; email: string },
+  bankId: number
+) {
+  try {
+    const { title, qCount } = await db.transaction(async (tx) => {
+      const existing = await tx
+        .select()
+        .from(questionBanks)
+        .where(eq(questionBanks.id, bankId));
+      const bank = existing[0];
+      const bankTitle = bank?.title || `Quiz Bank #${bankId}`;
+
+      const bankQuestions = await tx
+        .select({ id: questions.id })
+        .from(questions)
+        .where(eq(questions.questionBankId, bankId));
+      const qIds = bankQuestions.map((q) => q.id);
+
+      if (qIds.length > 0) {
+        await tx.delete(bookmarks).where(inArray(bookmarks.questionId, qIds));
+        await tx
+          .delete(questionAttempts)
+          .where(inArray(questionAttempts.questionId, qIds));
+        await tx.delete(questions).where(inArray(questions.id, qIds));
+      }
+
+      await tx.delete(questionBanks).where(eq(questionBanks.id, bankId));
+      return { title: bankTitle, qCount: qIds.length };
+    });
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'DELETE_QUIZ_BANK',
+      'question_bank',
+      bankId,
+      `Permanently deleted quiz bank "${title}" and ${qCount} question(s).`
+    );
+
+    return {
+      action: 'deleted',
+      message: `Quiz "${title}" and its questions were permanently deleted.`,
+    };
+  } catch (error) {
+    console.error('Error deleting quiz bank:', error);
+    throw new Error('Failed to delete quiz bank.', { cause: error });
+  }
+}
+
+/**
+ * Permanently deletes a Question and any bookmarks/attempts referencing it atomically.
  */
 export async function deleteOrArchiveQuestionAdmin(
   admin: { uid: string; email: string },
   questionId: number
 ) {
   try {
-    const existingAttempts = await db
-      .select()
-      .from(questionAttempts)
-      .where(eq(questionAttempts.questionId, questionId));
+    await db.transaction(async (tx) => {
+      await tx.delete(bookmarks).where(eq(bookmarks.questionId, questionId));
+      await tx
+        .delete(questionAttempts)
+        .where(eq(questionAttempts.questionId, questionId));
+      await tx.delete(questions).where(eq(questions.id, questionId));
+    });
 
-    if (existingAttempts.length > 0) {
-      const [archived] = await db
-        .update(questions)
-        .set({ status: 'archived', updatedAt: new Date() })
-        .where(eq(questions.id, questionId))
-        .returning();
-
-      await logAdminAction(
-        admin.uid,
-        admin.email,
-        'ARCHIVE_QUESTION',
-        'question',
-        questionId,
-        `Archived question #${questionId} instead of hard deletion because ${existingAttempts.length} historical student attempt(s) reference it.`
-      );
-      return {
-        action: 'archived',
-        message: `Question #${questionId} has ${existingAttempts.length} historical student attempt(s); it was safely archived to preserve historical exam records.`,
-        question: archived,
-      };
-    }
-
-    await db.delete(questions).where(eq(questions.id, questionId));
     await logAdminAction(
       admin.uid,
       admin.email,
       'DELETE_QUESTION',
       'question',
       questionId,
-      `Permanently deleted unused question #${questionId}`
+      `Permanently deleted question #${questionId}`
     );
     return {
       action: 'deleted',
-      message: `Unused question #${questionId} was permanently deleted.`,
+      message: `Question #${questionId} was permanently deleted.`,
     };
   } catch (error) {
-    console.error('Error deleting/archiving question:', error);
-    throw new Error('Failed to delete or archive question.', { cause: error });
+    console.error('Error deleting question:', error);
+    throw new Error('Failed to delete question.', { cause: error });
+  }
+}
+
+/**
+ * Permanently deletes a Student Exam / Quiz Session and its attempts atomically.
+ */
+export async function deleteExamSessionAdmin(
+  admin: { uid: string; email: string },
+  sessionId: number
+) {
+  try {
+    await db.transaction(async (tx) => {
+      await tx
+        .delete(questionAttempts)
+        .where(eq(questionAttempts.sessionId, sessionId));
+      await tx.delete(examSessions).where(eq(examSessions.id, sessionId));
+    });
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'DELETE_EXAM_SESSION',
+      'exam_session',
+      sessionId,
+      `Permanently deleted student quiz session #${sessionId}`
+    );
+
+    return {
+      action: 'deleted',
+      message: `Quiz session #${sessionId} was permanently deleted.`,
+    };
+  } catch (error) {
+    console.error('Error deleting exam session:', error);
+    throw new Error('Failed to delete quiz session.', { cause: error });
+  }
+}
+
+/**
+ * Changes a user's role between 'student' and 'admin' (one user at a time).
+ * The primary owner account (zeyadzedan098@gmail.com) is protected and cannot be demoted.
+ */
+export async function updateUserRoleAdmin(
+  admin: { uid: string; email: string },
+  targetUid: string,
+  newRole: 'student' | 'admin'
+) {
+  try {
+    const existing = await db
+      .select()
+      .from(users)
+      .where(eq(users.uid, targetUid));
+    const targetUser = existing[0];
+    if (!targetUser) {
+      throw new ClientSafeError('User account not found.', 404);
+    }
+
+    if (isOwnerAdminEmail(targetUser.email) && newRole !== 'admin') {
+      throw new ClientSafeError(
+        'The primary owner administrator account cannot be changed to student.',
+        403
+      );
+    }
+
+    const [updated] = await db
+      .update(users)
+      .set({
+        role: newRole,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.uid, targetUid))
+      .returning();
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'UPDATE_USER_ROLE',
+      'user',
+      targetUser.email,
+      `Changed role of "${targetUser.displayName}" (${targetUser.email}) to ${newRole.toUpperCase()}`
+    );
+
+    return {
+      user: sanitizeUserForClient(updated),
+      message: `${targetUser.displayName} (${targetUser.email}) is now set to ${
+        newRole === 'admin' ? 'Administrator' : 'Student'
+      }.`,
+    };
+  } catch (error: any) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error updating user role:', error);
+    throw new Error('Failed to update user role.', { cause: error });
+  }
+}
+
+/**
+ * Deletes a single user account and their individual records atomically, recording a tombstone
+ * so any active tokens for the deleted user are immediately rejected.
+ * The primary owner account (zeyadzedan098@gmail.com) cannot be deleted.
+ */
+export async function deleteUserAdmin(
+  admin: { uid: string; email: string },
+  targetUid: string
+) {
+  try {
+    const existing = await db
+      .select()
+      .from(users)
+      .where(eq(users.uid, targetUid));
+    const targetUser = existing[0];
+    if (!targetUser) {
+      throw new ClientSafeError('User account not found.', 404);
+    }
+
+    if (isOwnerAdminEmail(targetUser.email)) {
+      throw new ClientSafeError(
+        'The primary owner administrator account cannot be deleted.',
+        403
+      );
+    }
+
+    await deleteUserAccount(targetUid);
+
+    await logAdminAction(
+      admin.uid,
+      admin.email,
+      'DELETE_USER',
+      'user',
+      targetUser.email,
+      `Permanently deleted user account "${targetUser.displayName}" (${targetUser.email})`
+    );
+
+    return {
+      action: 'deleted',
+      message: `User account "${targetUser.displayName}" (${targetUser.email}) was permanently deleted.`,
+    };
+  } catch (error: any) {
+    if (error instanceof ClientSafeError) throw error;
+    console.error('Error deleting user:', error);
+    throw new Error('Failed to delete user account.', { cause: error });
   }
 }
 
@@ -1745,116 +2581,120 @@ export async function executeCsvImportAdmin(
 
     const report = parseAndValidateCsvQuestions(csvContent, existingHashes);
     if (report.headerErrors.length > 0) {
-      throw new Error(report.headerErrors.join(' '));
+      throw new ClientSafeError(report.headerErrors.join(' '), 400);
     }
 
-    // Check if the exact same file was already imported
     const existingBatch = await db
       .select()
       .from(importBatches)
       .where(eq(importBatches.fileHash, report.fileHash));
 
     if (existingBatch.length > 0 && report.validCount === 0) {
-      throw new Error(
+      throw new ClientSafeError(
         `Duplicate file submission prevented: "${fileName}" was already imported on ${new Date(
           existingBatch[0].createdAt
-        ).toLocaleString()}.`
+        ).toLocaleString()}.`,
+        409
       );
     }
 
-    const allSubjects = await db.select().from(subjects);
-    const allLectures = await db.select().from(lectures);
-
-    const subjectByTitle = new Map(
-      allSubjects.map((s) => [s.title.toLowerCase().trim(), s])
-    );
-    const lectureByKey = new Map(
-      allLectures.map((l) => [`${l.subjectId}:${l.title.toLowerCase().trim()}`, l])
-    );
-
-    let importedCount = 0;
+    const validRows = report.rows.filter((r) => r.isValid);
     const skippedCount = report.duplicateCount;
     const failedCount = report.invalidCount;
 
-    const validRows = report.rows.filter((r) => r.isValid);
+    const batchRecord = await db.transaction(async (tx) => {
+      const allSubjects = await tx.select().from(subjects);
+      const allLectures = await tx.select().from(lectures);
 
-    for (const row of validRows) {
-      const subjKey = row.subject.toLowerCase().trim();
-      let subj = subjectByTitle.get(subjKey);
-      if (!subj) {
-        const slug = `${subjKey.replace(/[^a-z0-9]+/g, '-')}-${Date.now().toString(36)}`;
-        const [newSubj] = await db
-          .insert(subjects)
-          .values({
-            slug,
-            title: row.subject.trim(),
-            description: `Imported subject: ${row.subject.trim()}`,
-            displayOrder: allSubjects.length + 1,
-            status: 'published',
-          })
-          .returning();
-        subj = newSubj;
-        subjectByTitle.set(subjKey, subj);
+      const subjectByTitle = new Map(
+        allSubjects.map((s) => [s.title.toLowerCase().trim(), s])
+      );
+      const lectureByKey = new Map(
+        allLectures.map((l) => [`${l.subjectId}:${l.title.toLowerCase().trim()}`, l])
+      );
+
+      let importedCount = 0;
+
+      for (const row of validRows) {
+        const subjKey = row.subject.toLowerCase().trim();
+        let subj = subjectByTitle.get(subjKey);
+        if (!subj) {
+          const slug = `${subjKey.replace(/[^a-z0-9]+/g, '-')}-${Date.now().toString(36)}-${importedCount}`;
+          const [newSubj] = await tx
+            .insert(subjects)
+            .values({
+              slug,
+              title: row.subject.trim(),
+              description: `Imported subject: ${row.subject.trim()}`,
+              displayOrder: subjectByTitle.size + 1,
+              status: 'published',
+            })
+            .returning();
+          subj = newSubj;
+          subjectByTitle.set(subjKey, subj);
+        }
+
+        const lectKey = `${subj.id}:${row.lecture.toLowerCase().trim()}`;
+        let lect = lectureByKey.get(lectKey);
+        if (!lect) {
+          const [newLect] = await tx
+            .insert(lectures)
+            .values({
+              subjectId: subj.id,
+              title: row.lecture.trim(),
+              description: `Imported lecture for ${subj.title}`,
+              lectureNumber: 1,
+              status: 'published',
+            })
+            .returning();
+          lect = newLect;
+          lectureByKey.set(lectKey, lect);
+        }
+
+        await tx.insert(questions).values({
+          subjectId: subj.id,
+          lectureId: lect.id,
+          questionText: row.questionText,
+          optionA: row.optionA,
+          optionB: row.optionB,
+          optionC: row.optionC,
+          optionD: row.optionD,
+          correctAnswer: row.correctAnswer,
+          explanation: row.explanation,
+          explanationA: row.explanationA,
+          explanationB: row.explanationB,
+          explanationC: row.explanationC,
+          explanationD: row.explanationD,
+          difficulty: row.difficulty,
+          tags: row.tags,
+          status: row.status,
+          version: 1,
+          contentHash: row.contentHash,
+        });
+
+        importedCount++;
       }
 
-      const lectKey = `${subj.id}:${row.lecture.toLowerCase().trim()}`;
-      let lect = lectureByKey.get(lectKey);
-      if (!lect) {
-        const [newLect] = await db
-          .insert(lectures)
-          .values({
-            subjectId: subj.id,
-            title: row.lecture.trim(),
-            description: `Imported lecture for ${subj.title}`,
-            lectureNumber: 1,
-            status: 'published',
-          })
-          .returning();
-        lect = newLect;
-        lectureByKey.set(lectKey, lect);
-      }
-
-      await db.insert(questions).values({
-        subjectId: subj.id,
-        lectureId: lect.id,
-        questionText: row.questionText,
-        optionA: row.optionA,
-        optionB: row.optionB,
-        optionC: row.optionC,
-        optionD: row.optionD,
-        correctAnswer: row.correctAnswer,
-        explanation: row.explanation,
-        explanationA: row.explanationA,
-        explanationB: row.explanationB,
-        explanationC: row.explanationC,
-        explanationD: row.explanationD,
-        difficulty: row.difficulty,
-        tags: row.tags,
-        status: row.status,
-        version: 1,
-        contentHash: row.contentHash,
-      });
-
-      importedCount++;
-    }
-
-    const [batchRecord] = await db
-      .insert(importBatches)
-      .values({
-        adminUid: admin.uid,
-        fileName: fileName || 'questions_import.csv',
-        fileHash: report.fileHash,
-        totalRows: report.totalRows,
-        importedCount,
-        skippedCount,
-        failedCount,
-        summaryJson: JSON.stringify({
+      const [insertedBatch] = await tx
+        .insert(importBatches)
+        .values({
+          adminUid: admin.uid,
+          fileName: fileName || 'questions_import.csv',
+          fileHash: report.fileHash,
+          totalRows: report.totalRows,
           importedCount,
           skippedCount,
           failedCount,
-        }),
-      })
-      .returning();
+          summaryJson: JSON.stringify({
+            importedCount,
+            skippedCount,
+            failedCount,
+          }),
+        })
+        .returning();
+
+      return insertedBatch;
+    });
 
     await logAdminAction(
       admin.uid,
@@ -1862,7 +2702,7 @@ export async function executeCsvImportAdmin(
       'BULK_CSV_IMPORT',
       'import_batch',
       batchRecord.id,
-      `Imported ${importedCount} questions from "${fileName}" (${skippedCount} duplicates skipped, ${failedCount} invalid rows rejected)`
+      `Imported ${batchRecord.importedCount} questions from "${fileName}" (${skippedCount} duplicates skipped, ${failedCount} invalid rows rejected)`
     );
 
     return {
@@ -1870,9 +2710,7 @@ export async function executeCsvImportAdmin(
       report,
     };
   } catch (error: any) {
-    if (error.message?.includes('Duplicate file submission') || error.message?.includes('Missing required CSV')) {
-      throw error;
-    }
+    if (error instanceof ClientSafeError) throw error;
     console.error('Error executing CSV import:', error);
     throw new Error('Failed to complete bulk CSV import.', { cause: error });
   }

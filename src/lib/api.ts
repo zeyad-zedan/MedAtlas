@@ -1,4 +1,9 @@
-import { signInWithPopup, signOut, onAuthStateChanged } from 'firebase/auth';
+import {
+  signInWithPopup,
+  signOut,
+  onAuthStateChanged,
+  sendPasswordResetEmail,
+} from 'firebase/auth';
 import { auth, googleAuthProvider } from './firebase.ts';
 
 const STORAGE_TOKEN_KEY = 'medatlas_session_token';
@@ -85,6 +90,8 @@ export interface UserProfile {
   uid: string;
   email: string;
   displayName: string;
+  authProvider?: string;
+  hasPassword?: boolean;
   role: 'student' | 'admin';
   subscriptionTier: string;
   subscriptionStatus: string;
@@ -96,11 +103,12 @@ export interface UserProfile {
 
 export const api = {
   // Public Catalog
-  getCatalog: () => apiRequest<{
-    subjects: any[];
-    lectures: any[];
-    totalPublishedQuestions: number;
-  }>('/api/catalog'),
+  getCatalog: () =>
+    apiRequest<{
+      subjects: any[];
+      lectures: any[];
+      totalPublishedQuestions: number;
+    }>('/api/catalog'),
 
   // Authentication
   registerWithEmail: async (email: string, password: string, displayName: string) => {
@@ -135,13 +143,66 @@ export const api = {
     return data.user;
   },
 
-  resetPassword: (email: string, newPassword: string) =>
+  requestPasswordReset: async (email: string) => {
+    const res = await apiRequest<{
+      accepted: boolean;
+      message: string;
+      expiresInMinutes: number;
+    }>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    // Also trigger Firebase Auth password reset email best-effort if the user is registered in Firebase
+    try {
+      await sendPasswordResetEmail(auth, email.trim());
+    } catch {
+      // Enumeration-safe: ignore Firebase error if account is local-only or non-existent
+    }
+    return res;
+  },
+
+  confirmPasswordReset: (token: string, newPassword: string) =>
     apiRequest<{ message: string }>('/api/auth/reset-password', {
       method: 'POST',
-      body: JSON.stringify({ email, newPassword }),
+      body: JSON.stringify({ token, newPassword }),
     }),
 
+  changePassword: async (currentPassword: string, newPassword: string) => {
+    const data = await apiRequest<{
+      message: string;
+      token: string;
+      user: UserProfile;
+    }>('/api/auth/change-password', {
+      method: 'POST',
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    setAuthToken(data.token);
+    return data;
+  },
+
+  linkPassword: async (newPassword: string) => {
+    const data = await apiRequest<{
+      message: string;
+      token: string;
+      user: UserProfile;
+    }>('/api/auth/link-password', {
+      method: 'POST',
+      body: JSON.stringify({ newPassword }),
+    });
+    setAuthToken(data.token);
+    return data;
+  },
+
   logout: async () => {
+    if (inMemoryAuthToken) {
+      try {
+        await apiRequest<{ loggedOut: boolean }>('/api/auth/logout', {
+          method: 'POST',
+        });
+      } catch {
+        // ignore if token already expired
+      }
+    }
     setAuthToken(null);
     try {
       await signOut(auth);
@@ -163,6 +224,11 @@ export const api = {
       method: 'DELETE',
     });
     setAuthToken(null);
+    try {
+      await signOut(auth);
+    } catch {
+      // ignore
+    }
     return res;
   },
 
@@ -248,9 +314,58 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  deleteSubject: (subjectId: number) =>
+    apiRequest<{ action: string; message: string }>(
+      `/api/admin/subjects/${subjectId}`,
+      {
+        method: 'DELETE',
+      }
+    ),
+
+  deleteLecture: (lectureId: number) =>
+    apiRequest<{ action: string; message: string }>(
+      `/api/admin/lectures/${lectureId}`,
+      {
+        method: 'DELETE',
+      }
+    ),
+
+  deleteQuestionBank: (bankId: number) =>
+    apiRequest<{ action: string; message: string }>(
+      `/api/admin/question-banks/${bankId}`,
+      {
+        method: 'DELETE',
+      }
+    ),
+
   deleteOrArchiveQuestion: (questionId: number) =>
     apiRequest<{ action: string; message: string }>(
       `/api/admin/questions/${questionId}`,
+      {
+        method: 'DELETE',
+      }
+    ),
+
+  deleteSessionAdmin: (sessionId: number) =>
+    apiRequest<{ action: string; message: string }>(
+      `/api/admin/sessions/${sessionId}`,
+      {
+        method: 'DELETE',
+      }
+    ),
+
+  updateUserRole: (targetUid: string, role: 'student' | 'admin') =>
+    apiRequest<{ user: UserProfile; message: string }>(
+      `/api/admin/users/${encodeURIComponent(targetUid)}/role`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ role }),
+      }
+    ),
+
+  deleteUserAdmin: (targetUid: string) =>
+    apiRequest<{ action: string; message: string }>(
+      `/api/admin/users/${encodeURIComponent(targetUid)}`,
       {
         method: 'DELETE',
       }

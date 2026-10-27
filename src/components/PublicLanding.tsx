@@ -38,12 +38,16 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
+  const [recoveryToken, setRecoveryToken] = useState('');
+  const [resetStep, setResetStep] = useState<'request' | 'confirm'>('request');
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
 
   const openAuth = (tab: AuthTab) => {
     setAuthTab(tab);
+    setResetStep('request');
+    setRecoveryToken('');
     setAuthError(null);
     setAuthSuccess(null);
     setAuthModalOpen(true);
@@ -64,9 +68,18 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
         setAuthModalOpen(false);
         onAuthenticated(user, 'dashboard');
       } else if (authTab === 'reset') {
-        const res = await api.resetPassword(email, password);
-        setAuthSuccess(res.message);
-        setAuthTab('login');
+        if (resetStep === 'request') {
+          const res = await api.requestPasswordReset(email);
+          setAuthSuccess(res.message);
+          setResetStep('confirm');
+        } else {
+          const res = await api.confirmPasswordReset(recoveryToken, password);
+          setAuthSuccess(res.message);
+          setRecoveryToken('');
+          setPassword('');
+          setResetStep('request');
+          setAuthTab('login');
+        }
       }
     } catch (err: any) {
       setAuthError(err.message || 'Authentication failed.');
@@ -663,42 +676,67 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                 </div>
               )}
 
-              <div>
-                <label
-                  htmlFor="auth-email"
-                  className="block text-xs font-semibold text-slate-700 mb-1"
-                >
-                  Academic or Personal Email
-                </label>
-                <input
-                  id="auth-email"
-                  type="email"
-                  required
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="student@medschool.edu"
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
-                />
-              </div>
+              {(authTab !== 'reset' || resetStep === 'request') && (
+                <div>
+                  <label
+                    htmlFor="auth-email"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Academic or Personal Email
+                  </label>
+                  <input
+                    id="auth-email"
+                    type="email"
+                    required
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="student@medschool.edu"
+                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
+                </div>
+              )}
 
-              <div>
-                <label
-                  htmlFor="auth-password"
-                  className="block text-xs font-semibold text-slate-700 mb-1"
-                >
-                  {authTab === 'reset' ? 'New Password (min 8 characters)' : 'Password'}
-                </label>
-                <input
-                  id="auth-password"
-                  type="password"
-                  required
-                  minLength={8}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="••••••••"
-                  className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
-                />
-              </div>
+              {authTab === 'reset' && resetStep === 'confirm' && (
+                <div>
+                  <label
+                    htmlFor="auth-recovery-token"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Single-Use Password Recovery Token
+                  </label>
+                  <input
+                    id="auth-recovery-token"
+                    type="text"
+                    required
+                    minLength={32}
+                    value={recoveryToken}
+                    onChange={(e) => setRecoveryToken(e.target.value)}
+                    placeholder="Paste your 64-character recovery token"
+                    className="w-full px-3 py-2 text-sm font-mono-tabular rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
+                </div>
+              )}
+
+              {(authTab !== 'reset' || resetStep === 'confirm') && (
+                <div>
+                  <label
+                    htmlFor="auth-password"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    {authTab === 'reset' ? 'New Password (min 8 characters)' : 'Password'}
+                  </label>
+                  <input
+                    id="auth-password"
+                    type="password"
+                    required
+                    minLength={8}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -711,8 +749,38 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                   ? 'Sign In with Email'
                   : authTab === 'register'
                   ? 'Create Student Account'
-                  : 'Update Password'}
+                  : resetStep === 'request'
+                  ? 'Send Recovery Instructions'
+                  : 'Verify Token & Update Password'}
               </button>
+
+              {authTab === 'reset' && (
+                <div className="flex items-center justify-between text-xs text-slate-600 pt-1">
+                  {resetStep === 'request' ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setResetStep('confirm');
+                        setAuthError(null);
+                      }}
+                      className="text-[#0284C7] hover:underline font-medium cursor-pointer"
+                    >
+                      Already have a recovery token? Enter it here →
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setResetStep('request');
+                        setAuthError(null);
+                      }}
+                      className="text-slate-600 hover:text-slate-900 font-medium cursor-pointer"
+                    >
+                      ← Back to request recovery instructions
+                    </button>
+                  )}
+                </div>
+              )}
             </form>
 
             <div className="pt-3 border-t border-slate-200">

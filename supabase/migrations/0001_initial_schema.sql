@@ -9,14 +9,34 @@ CREATE TABLE IF NOT EXISTS public.users (
   email TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
   password_hash TEXT,
+  auth_provider TEXT NOT NULL DEFAULT 'local' CHECK (auth_provider IN ('local', 'firebase', 'linked')),
+  token_version INTEGER NOT NULL DEFAULT 1,
+  account_status TEXT NOT NULL DEFAULT 'active' CHECK (account_status IN ('active', 'deleted', 'suspended')),
+  deleted_at TIMESTAMP WITHOUT TIME ZONE,
   role TEXT NOT NULL DEFAULT 'student' CHECK (role IN ('student', 'admin')),
   subscription_tier TEXT NOT NULL DEFAULT 'free_trial',
   subscription_status TEXT NOT NULL DEFAULT 'active',
   subscription_expires_at TIMESTAMP WITHOUT TIME ZONE,
-  email_verified BOOLEAN NOT NULL DEFAULT TRUE,
+  email_verified BOOLEAN NOT NULL DEFAULT FALSE,
   preferences TEXT NOT NULL DEFAULT '{}',
   created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.password_reset_tokens (
+  id SERIAL PRIMARY KEY,
+  user_uid TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+  consumed_at TIMESTAMP WITHOUT TIME ZONE,
+  created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS public.deleted_accounts (
+  id SERIAL PRIMARY KEY,
+  uid TEXT NOT NULL UNIQUE,
+  email_hash TEXT NOT NULL,
+  deleted_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS public.subjects (
@@ -119,6 +139,9 @@ CREATE TABLE IF NOT EXISTS public.question_attempts (
   answered_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_question_attempt
+  ON public.question_attempts(session_id, question_id);
+
 CREATE TABLE IF NOT EXISTS public.bookmarks (
   id SERIAL PRIMARY KEY,
   user_uid TEXT NOT NULL,
@@ -159,9 +182,12 @@ CREATE INDEX IF NOT EXISTS idx_questions_content_hash ON public.questions(conten
 CREATE INDEX IF NOT EXISTS idx_exam_sessions_user_uid ON public.exam_sessions(user_uid, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_question_attempts_user_uid ON public.question_attempts(user_uid, answered_at DESC);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_user_uid ON public.bookmarks(user_uid, question_id);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_uid ON public.password_reset_tokens(user_uid);
 
 -- Row Level Security (RLS) Enablement & Policies
 ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.password_reset_tokens ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.deleted_accounts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.subjects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.lectures ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.question_banks ENABLE ROW LEVEL SECURITY;

@@ -21,7 +21,13 @@ interface AdminConsoleProps {
   onRefresh: () => void;
 }
 
-type AdminSection = 'overview' | 'subjects' | 'lectures' | 'questions' | 'import';
+type AdminSection =
+  | 'overview'
+  | 'users'
+  | 'subjects'
+  | 'lectures'
+  | 'questions'
+  | 'import';
 
 export const AdminConsole: React.FC<AdminConsoleProps> = ({
   adminData,
@@ -60,6 +66,21 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
   const [previewQuestion, setPreviewQuestion] = useState<any | null>(null);
   const [confirmDeleteQuestionId, setConfirmDeleteQuestionId] = useState<
     number | null
+  >(null);
+  const [confirmDeleteSubjectId, setConfirmDeleteSubjectId] = useState<
+    number | null
+  >(null);
+  const [confirmDeleteLectureId, setConfirmDeleteLectureId] = useState<
+    number | null
+  >(null);
+  const [confirmDeleteBankId, setConfirmDeleteBankId] = useState<
+    number | null
+  >(null);
+  const [confirmDeleteSessionId, setConfirmDeleteSessionId] = useState<
+    number | null
+  >(null);
+  const [confirmDeleteUserUid, setConfirmDeleteUserUid] = useState<
+    string | null
   >(null);
 
   const [qSubjectId, setQSubjectId] = useState<number>(0);
@@ -102,8 +123,10 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
 
   const {
     metrics,
+    users = [],
     subjects = [],
     lectures = [],
+    questionBanks = [],
     questions = [],
     recentActivity = [],
     recentImports = [],
@@ -113,6 +136,33 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
   const clearAlerts = () => {
     setFeedbackMsg(null);
     setErrorMsg(null);
+  };
+
+  // User Role & Individual User Deletion Handlers
+  const handleToggleUserRole = async (
+    targetUid: string,
+    newRole: 'student' | 'admin'
+  ) => {
+    clearAlerts();
+    try {
+      const res = await api.updateUserRole(targetUid, newRole);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to update user role.');
+    }
+  };
+
+  const handleDeleteUser = async (targetUid: string) => {
+    clearAlerts();
+    try {
+      const res = await api.deleteUserAdmin(targetUid);
+      setConfirmDeleteUserUid(null);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to delete user.');
+    }
   };
 
   // Subject Handlers
@@ -279,6 +329,42 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
     }
   };
 
+  const handleDeleteSubject = async (subjectId: number) => {
+    clearAlerts();
+    try {
+      const res = await api.deleteSubject(subjectId);
+      setConfirmDeleteSubjectId(null);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to delete subject.');
+    }
+  };
+
+  const handleDeleteLecture = async (lectureId: number) => {
+    clearAlerts();
+    try {
+      const res = await api.deleteLecture(lectureId);
+      setConfirmDeleteLectureId(null);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to delete lecture.');
+    }
+  };
+
+  const handleDeleteQuestionBank = async (bankId: number) => {
+    clearAlerts();
+    try {
+      const res = await api.deleteQuestionBank(bankId);
+      setConfirmDeleteBankId(null);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to delete quiz bank.');
+    }
+  };
+
   const handleDeleteOrArchiveQuestion = async (questionId: number) => {
     clearAlerts();
     try {
@@ -288,6 +374,18 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
       onRefresh();
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to delete question.');
+    }
+  };
+
+  const handleDeleteSession = async (sessionId: number) => {
+    clearAlerts();
+    try {
+      const res = await api.deleteSessionAdmin(sessionId);
+      setConfirmDeleteSessionId(null);
+      setFeedbackMsg(res.message);
+      onRefresh();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to delete quiz session.');
     }
   };
 
@@ -416,6 +514,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           {(
             [
               { id: 'overview', label: 'Overview & Logs' },
+              { id: 'users', label: `Users & Roles (${users.length})` },
               { id: 'subjects', label: `Subjects (${subjects.length})` },
               { id: 'lectures', label: `Lectures (${lectures.length})` },
               { id: 'questions', label: `Question Bank (${questions.length})` },
@@ -500,22 +599,56 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                 <p className="text-xs text-slate-500">No recent sessions recorded.</p>
               ) : (
                 <div className="space-y-2.5 text-xs">
-                  {recentActivity.slice(0, 6).map((act: any) => (
+                  {recentActivity.slice(0, 8).map((act: any) => (
                     <div
                       key={act.id}
-                      className="p-3 rounded-lg border border-slate-200 flex items-center justify-between"
+                      className="p-3 rounded-lg border border-slate-200 space-y-2"
                     >
-                      <div>
-                        <p className="font-semibold text-slate-900">{act.title}</p>
-                        <p className="text-slate-500 font-mono-tabular">
-                          UID: {act.userUid} · Mode: {act.mode}
-                        </p>
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="font-semibold text-slate-900">{act.title}</p>
+                          <p className="text-slate-500 font-mono-tabular">
+                            UID: {act.userUid} · Mode: {act.mode}
+                          </p>
+                        </div>
+                        <div className="flex items-center gap-3">
+                          <span className="font-mono-tabular font-bold text-slate-800">
+                            {act.status === 'completed'
+                              ? `${act.scorePercentage}%`
+                              : 'Active'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteSessionId(act.id)}
+                            className="text-red-700 hover:underline font-semibold cursor-pointer"
+                          >
+                            Delete
+                          </button>
+                        </div>
                       </div>
-                      <span className="font-mono-tabular font-bold text-slate-800">
-                        {act.status === 'completed'
-                          ? `${act.scorePercentage}%`
-                          : 'Active'}
-                      </span>
+                      {confirmDeleteSessionId === act.id && (
+                        <div className="p-2.5 rounded bg-red-50 border border-red-200 flex items-center justify-between gap-2 text-xs">
+                          <span className="font-semibold text-red-900">
+                            Delete this quiz session #{act.id}?
+                          </span>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSession(act.id)}
+                              className="px-2.5 py-1 font-semibold text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                            >
+                              Confirm Delete
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteSessionId(null)}
+                              className="px-2.5 py-1 font-semibold text-slate-700 bg-white border border-slate-300 rounded cursor-pointer"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -523,9 +656,11 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
             </div>
 
             <div className="lg:col-span-6 bg-white rounded-xl border border-slate-200 p-6 space-y-4">
-              <h2 className="text-base font-bold text-slate-900">
-                Administrative Audit Logs
-              </h2>
+              <div className="flex items-center justify-between">
+                <h2 className="text-base font-bold text-slate-900">
+                  Administrative Audit Logs
+                </h2>
+              </div>
               {auditLogs.length === 0 ? (
                 <p className="text-xs text-slate-500">No audit entries yet.</p>
               ) : (
@@ -552,20 +687,160 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
       )}
 
       {/* ====================================================================
+          SECTION 1.5: USERS & ROLES (PROMOTE STUDENT TO ADMIN OR DEMOTE)
+      ==================================================================== */}
+      {section === 'users' && (
+        <div className="space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <h2 className="text-lg font-bold text-slate-900">
+                Registered Accounts &amp; Role Management
+              </h2>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Promote any student account to Administrator (&ldquo;Make Admin&rdquo;) or change an administrator back to Student (&ldquo;Change to Student&rdquo;). The primary owner account is permanently protected.
+              </p>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+            {users.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                No registered users found.
+              </div>
+            ) : (
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <th className="py-3 px-4 font-semibold">User</th>
+                    <th className="py-3 px-4 font-semibold">Email</th>
+                    <th className="py-3 px-4 font-semibold">Role</th>
+                    <th className="py-3 px-4 font-semibold">Joined</th>
+                    <th className="py-3 px-4 font-semibold text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {users.map((u: any) => (
+                    <React.Fragment key={u.uid}>
+                      <tr className="hover:bg-slate-50">
+                        <td className="py-3 px-4 font-semibold text-slate-900">
+                          {u.displayName}
+                          {u.isOwner && (
+                            <span className="ml-2 text-[11px] font-mono-tabular text-[#0284C7]">
+                              (Primary Owner)
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 font-mono-tabular text-slate-700">
+                          {u.email}
+                        </td>
+                        <td className="py-3 px-4 uppercase font-mono-tabular font-bold">
+                          <span
+                            className={
+                              u.role === 'admin'
+                                ? 'text-[#0284C7]'
+                                : 'text-slate-600'
+                            }
+                          >
+                            {u.role}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 font-mono-tabular text-slate-500">
+                          {u.createdAt
+                            ? new Date(u.createdAt).toLocaleDateString()
+                            : '—'}
+                        </td>
+                        <td className="py-3 px-4 text-right space-x-3 whitespace-nowrap">
+                          {u.isOwner ? (
+                            <span className="text-slate-400 font-medium">
+                              Protected Owner Admin
+                            </span>
+                          ) : (
+                            <>
+                              {u.role === 'student' ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleUserRole(u.uid, 'admin')
+                                  }
+                                  className="px-3 py-1 font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded cursor-pointer"
+                                >
+                                  Make Admin
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleUserRole(u.uid, 'student')
+                                  }
+                                  className="px-3 py-1 font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 border border-slate-300 rounded cursor-pointer"
+                                >
+                                  Change to Student
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteUserUid(u.uid)}
+                                className="font-semibold text-red-700 hover:underline cursor-pointer"
+                              >
+                                Delete User
+                              </button>
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                      {confirmDeleteUserUid === u.uid && (
+                        <tr className="bg-red-50/80">
+                          <td colSpan={5} className="p-3">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                              <span className="font-semibold text-red-900">
+                                Permanently delete user &ldquo;{u.email}&rdquo; and all of their sessions and progress?
+                              </span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteUser(u.uid)}
+                                  className="px-3 py-1 font-semibold text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                                >
+                                  Confirm Delete User
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteUserUid(null)}
+                                  className="px-3 py-1 font-semibold text-slate-700 bg-white border border-slate-300 rounded cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ====================================================================
           SECTION 2: SUBJECT MANAGEMENT
       ==================================================================== */}
       {section === 'subjects' && (
         <div className="space-y-6">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <h2 className="text-lg font-bold text-slate-900">Manage Subjects</h2>
-            <button
-              type="button"
-              onClick={() => startEditSubject()}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              New Subject
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => startEditSubject()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                New Subject
+              </button>
+            </div>
           </div>
 
           {editingSubject && (
@@ -649,58 +924,110 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           )}
 
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
-                  <th className="py-3 px-4 font-semibold">Order</th>
-                  <th className="py-3 px-4 font-semibold">Subject Title</th>
-                  <th className="py-3 px-4 font-semibold">Status</th>
-                  <th className="py-3 px-4 font-semibold text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {subjects.map((s: any) => (
-                  <tr key={s.id} className="hover:bg-slate-50">
-                    <td className="py-3 px-4 font-mono-tabular">{s.displayOrder}</td>
-                    <td className="py-3 px-4">
-                      <p className="font-bold text-slate-900">{s.title}</p>
-                      <p className="text-slate-500">{s.description}</p>
-                    </td>
-                    <td className="py-3 px-4 uppercase font-mono-tabular font-semibold">
-                      {s.status}
-                    </td>
-                    <td className="py-3 px-4 text-right space-x-3 whitespace-nowrap">
-                      <button
-                        type="button"
-                        onClick={() => startEditSubject(s)}
-                        className="font-semibold text-[#0284C7] hover:underline cursor-pointer"
-                      >
-                        Edit
-                      </button>
-                    </td>
+            {subjects.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                No subjects exist in the database. Click &ldquo;New Subject&rdquo; above or import via CSV to add your subjects.
+              </div>
+            ) : (
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <th className="py-3 px-4 font-semibold">Order</th>
+                    <th className="py-3 px-4 font-semibold">Subject Title</th>
+                    <th className="py-3 px-4 font-semibold">Content</th>
+                    <th className="py-3 px-4 font-semibold">Status</th>
+                    <th className="py-3 px-4 font-semibold text-right">Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {subjects.map((s: any) => (
+                    <React.Fragment key={s.id}>
+                      <tr className="hover:bg-slate-50">
+                        <td className="py-3 px-4 font-mono-tabular">
+                          {s.displayOrder}
+                        </td>
+                        <td className="py-3 px-4">
+                          <p className="font-bold text-slate-900">{s.title}</p>
+                          <p className="text-slate-500">{s.description}</p>
+                        </td>
+                        <td className="py-3 px-4 font-mono-tabular text-slate-600">
+                          {s.lectureCount ?? 0} Lectures · {s.questionCount ?? 0} MCQs
+                        </td>
+                        <td className="py-3 px-4 uppercase font-mono-tabular font-semibold">
+                          {s.status}
+                        </td>
+                        <td className="py-3 px-4 text-right space-x-3 whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => startEditSubject(s)}
+                            className="font-semibold text-[#0284C7] hover:underline cursor-pointer"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteSubjectId(s.id)}
+                            className="font-semibold text-red-700 hover:underline cursor-pointer"
+                          >
+                            Delete Subject
+                          </button>
+                        </td>
+                      </tr>
+                      {confirmDeleteSubjectId === s.id && (
+                        <tr className="bg-red-50/80">
+                          <td colSpan={5} className="p-3">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                              <span className="font-semibold text-red-900">
+                                Permanently delete subject &ldquo;{s.title}&rdquo; along with its lectures, quizzes, and questions?
+                              </span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteSubject(s.id)}
+                                  className="px-3 py-1 font-semibold text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                                >
+                                  Confirm Permanent Delete
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteSubjectId(null)}
+                                  className="px-3 py-1 font-semibold text-slate-700 bg-white border border-slate-300 rounded cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </div>
       )}
 
       {/* ====================================================================
-          SECTION 3: LECTURE MANAGEMENT
+          SECTION 3: LECTURE & QUIZ MANAGEMENT
       ==================================================================== */}
       {section === 'lectures' && (
         <div className="space-y-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-bold text-slate-900">Manage Lectures</h2>
-            <button
-              type="button"
-              onClick={() => startEditLecture()}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              New Lecture
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="text-lg font-bold text-slate-900">
+              Manage Lectures &amp; Quizzes
+            </h2>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => startEditLecture()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                New Lecture
+              </button>
+            </div>
           </div>
 
           {editingLecture && (
@@ -812,44 +1139,165 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
           )}
 
           <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
-                  <th className="py-3 px-4 font-semibold">Subject</th>
-                  <th className="py-3 px-4 font-semibold">#</th>
-                  <th className="py-3 px-4 font-semibold">Lecture Title</th>
-                  <th className="py-3 px-4 font-semibold">Status</th>
-                  <th className="py-3 px-4 font-semibold text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {lectures.map((l: any) => (
-                  <tr key={l.id} className="hover:bg-slate-50">
-                    <td className="py-3 px-4 font-medium text-slate-700">
-                      {l.subjectTitle}
-                    </td>
-                    <td className="py-3 px-4 font-mono-tabular">{l.lectureNumber}</td>
-                    <td className="py-3 px-4">
-                      <p className="font-bold text-slate-900">{l.title}</p>
-                      <p className="text-slate-500">{l.description}</p>
-                    </td>
-                    <td className="py-3 px-4 uppercase font-mono-tabular font-semibold">
-                      {l.status}
-                    </td>
-                    <td className="py-3 px-4 text-right">
-                      <button
-                        type="button"
-                        onClick={() => startEditLecture(l)}
-                        className="font-semibold text-[#0284C7] hover:underline cursor-pointer"
-                      >
-                        Edit
-                      </button>
-                    </td>
+            {lectures.length === 0 ? (
+              <div className="p-8 text-center text-xs text-slate-500">
+                No lectures or quizzes exist in the database.
+              </div>
+            ) : (
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+                    <th className="py-3 px-4 font-semibold">Subject</th>
+                    <th className="py-3 px-4 font-semibold">#</th>
+                    <th className="py-3 px-4 font-semibold">Lecture Title</th>
+                    <th className="py-3 px-4 font-semibold">Questions</th>
+                    <th className="py-3 px-4 font-semibold">Status</th>
+                    <th className="py-3 px-4 font-semibold text-right">Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {lectures.map((l: any) => (
+                    <React.Fragment key={l.id}>
+                      <tr className="hover:bg-slate-50">
+                        <td className="py-3 px-4 font-medium text-slate-700">
+                          {l.subjectTitle}
+                        </td>
+                        <td className="py-3 px-4 font-mono-tabular">
+                          {l.lectureNumber}
+                        </td>
+                        <td className="py-3 px-4">
+                          <p className="font-bold text-slate-900">{l.title}</p>
+                          <p className="text-slate-500">{l.description}</p>
+                        </td>
+                        <td className="py-3 px-4 font-mono-tabular text-slate-600">
+                          {l.questionCount ?? 0} MCQs
+                        </td>
+                        <td className="py-3 px-4 uppercase font-mono-tabular font-semibold">
+                          {l.status}
+                        </td>
+                        <td className="py-3 px-4 text-right space-x-3 whitespace-nowrap">
+                          <button
+                            type="button"
+                            onClick={() => startEditLecture(l)}
+                            className="font-semibold text-[#0284C7] hover:underline cursor-pointer"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteLectureId(l.id)}
+                            className="font-semibold text-red-700 hover:underline cursor-pointer"
+                          >
+                            Delete Lecture &amp; Quiz
+                          </button>
+                        </td>
+                      </tr>
+                      {confirmDeleteLectureId === l.id && (
+                        <tr className="bg-red-50/80">
+                          <td colSpan={6} className="p-3">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                              <span className="font-semibold text-red-900">
+                                Permanently delete lecture &ldquo;{l.title}&rdquo; and its quizzes and questions?
+                              </span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteLecture(l.id)}
+                                  className="px-3 py-1 font-semibold text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                                >
+                                  Confirm Permanent Delete
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteLectureId(null)}
+                                  className="px-3 py-1 font-semibold text-slate-700 bg-white border border-slate-300 rounded cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
+
+          {questionBanks.length > 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+              <div className="px-4 py-3 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+                <h3 className="text-xs font-bold text-slate-800">
+                  Individual Quiz Banks ({questionBanks.length})
+                </h3>
+              </div>
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="border-b border-slate-200 text-slate-500">
+                    <th className="py-2.5 px-4 font-semibold">Quiz Title</th>
+                    <th className="py-2.5 px-4 font-semibold">Subject / Lecture</th>
+                    <th className="py-2.5 px-4 font-semibold">Type</th>
+                    <th className="py-2.5 px-4 font-semibold text-right">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {questionBanks.map((b: any) => (
+                    <React.Fragment key={b.id}>
+                      <tr className="hover:bg-slate-50">
+                        <td className="py-2.5 px-4 font-semibold text-slate-900">
+                          {b.title}
+                        </td>
+                        <td className="py-2.5 px-4 text-slate-600">
+                          {b.subjectTitle} · {b.lectureTitle}
+                        </td>
+                        <td className="py-2.5 px-4 font-mono-tabular uppercase">
+                          {b.bankType}
+                        </td>
+                        <td className="py-2.5 px-4 text-right">
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteBankId(b.id)}
+                            className="font-semibold text-red-700 hover:underline cursor-pointer"
+                          >
+                            Delete Quiz
+                          </button>
+                        </td>
+                      </tr>
+                      {confirmDeleteBankId === b.id && (
+                        <tr className="bg-red-50/80">
+                          <td colSpan={4} className="p-3">
+                            <div className="flex items-center justify-between gap-2 text-xs">
+                              <span className="font-semibold text-red-900">
+                                Permanently delete quiz &ldquo;{b.title}&rdquo;?
+                              </span>
+                              <div className="flex items-center gap-2 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteQuestionBank(b.id)}
+                                  className="px-3 py-1 font-semibold text-white bg-red-600 hover:bg-red-700 rounded cursor-pointer"
+                                >
+                                  Confirm Delete
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmDeleteBankId(null)}
+                                  className="px-3 py-1 font-semibold text-slate-700 bg-white border border-slate-300 rounded cursor-pointer"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       )}
 
@@ -902,14 +1350,16 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
               </select>
             </div>
 
-            <button
-              type="button"
-              onClick={() => startEditQuestion()}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-              Create Question Manually
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => startEditQuestion()}
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0284C7] hover:bg-[#0369A1] rounded-lg cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                Create Question Manually
+              </button>
+            </div>
           </div>
 
           {editingQuestion && (
@@ -1155,7 +1605,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                       onClick={() => setConfirmDeleteQuestionId(q.id)}
                       className="font-semibold text-red-700 hover:underline cursor-pointer"
                     >
-                      Delete / Archive
+                      Delete Permanently
                     </button>
                   </div>
                 </div>
@@ -1171,7 +1621,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                 {confirmDeleteQuestionId === q.id && (
                   <div className="p-3 rounded-lg bg-red-50 border border-red-200 flex items-center justify-between text-xs">
                     <span className="text-red-900 font-medium">
-                      Confirm action on Question #{q.id}: If students have already attempted this question, it will be safely archived rather than destroyed.
+                      Permanently delete Question #{q.id} from the database?
                     </span>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -1179,7 +1629,7 @@ export const AdminConsole: React.FC<AdminConsoleProps> = ({
                         onClick={() => handleDeleteOrArchiveQuestion(q.id)}
                         className="px-3 py-1 font-semibold text-white bg-red-600 rounded cursor-pointer"
                       >
-                        Confirm
+                        Confirm Permanent Delete
                       </button>
                       <button
                         type="button"

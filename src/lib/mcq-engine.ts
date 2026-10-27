@@ -108,6 +108,31 @@ export function resolveDisplayedOption(
 }
 
 /**
+ * Sanitizes SVG markup before rendering to prevent stored XSS via <script>, <foreignObject>,
+ * inline event handlers (onload, onerror, onclick, etc.), or javascript:/data:text/html URIs.
+ */
+export function sanitizeSvgDiagram(rawSvg: string | null | undefined): string {
+  if (!rawSvg || typeof rawSvg !== 'string') return '';
+  const trimmed = rawSvg.trim();
+  if (!trimmed) return '';
+
+  const withoutDangerousTags = trimmed
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<script[^>]*\/?>/gi, '')
+    .replace(/<foreignObject[\s\S]*?>[\s\S]*?<\/foreignObject>/gi, '')
+    .replace(/<iframe[\s\S]*?>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<object[\s\S]*?>[\s\S]*?<\/object>/gi, '')
+    .replace(/<embed[^>]*\/?>/gi, '')
+    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(
+      /\s(?:href|xlink:href|src)\s*=\s*(?:"\s*(?:javascript:|data:text\/html)[^"]*"|'\s*(?:javascript:|data:text\/html)[^']*')/gi,
+      ''
+    );
+
+  return withoutDangerousTags;
+}
+
+/**
  * Formats question options according to the option permutation.
  * During active Exam Mode (hideAnswers = true), strips correctAnswer and all explanations
  * so the browser cannot inspect them in network payloads or DOM state.
@@ -138,6 +163,8 @@ export function formatQuestionForClient(
     D: canonicalOptions[permutation.D],
   };
 
+  const safeDiagramSvg = sanitizeSvgDiagram(question.diagramSvg);
+
   if (hideAnswers) {
     return {
       id: question.id,
@@ -149,7 +176,7 @@ export function formatQuestionForClient(
       options: displayedOptions,
       difficulty: question.difficulty,
       tags: question.tags,
-      diagramSvg: question.diagramSvg || '',
+      diagramSvg: safeDiagramSvg,
       permutation,
     };
   }
@@ -175,7 +202,7 @@ export function formatQuestionForClient(
     optionExplanations: displayedExplanations,
     difficulty: question.difficulty,
     tags: question.tags,
-    diagramSvg: question.diagramSvg || '',
+    diagramSvg: safeDiagramSvg,
     permutation,
   };
 }

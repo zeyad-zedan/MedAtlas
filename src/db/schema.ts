@@ -1,5 +1,13 @@
 import { relations } from 'drizzle-orm';
-import { boolean, integer, pgTable, serial, text, timestamp } from 'drizzle-orm/pg-core';
+import {
+  boolean,
+  integer,
+  pgTable,
+  serial,
+  text,
+  timestamp,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
 
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
@@ -7,14 +15,34 @@ export const users = pgTable('users', {
   email: text('email').notNull().unique(),
   displayName: text('display_name').notNull(),
   passwordHash: text('password_hash'),
+  authProvider: text('auth_provider').notNull().default('local'), // 'local' | 'firebase' | 'linked'
+  tokenVersion: integer('token_version').notNull().default(1),
+  accountStatus: text('account_status').notNull().default('active'), // 'active' | 'deleted' | 'suspended'
+  deletedAt: timestamp('deleted_at'),
   role: text('role').notNull().default('student'), // 'student' | 'admin'
   subscriptionTier: text('subscription_tier').notNull().default('free_trial'), // 'free_trial' | 'free' | 'premium_monthly' | 'premium_annual'
   subscriptionStatus: text('subscription_status').notNull().default('active'), // 'active' | 'trialing' | 'expired' | 'canceled'
   subscriptionExpiresAt: timestamp('subscription_expires_at'),
-  emailVerified: boolean('email_verified').notNull().default(true),
+  emailVerified: boolean('email_verified').notNull().default(false),
   preferences: text('preferences').notNull().default('{}'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const passwordResetTokens = pgTable('password_reset_tokens', {
+  id: serial('id').primaryKey(),
+  userUid: text('user_uid').notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at').notNull(),
+  consumedAt: timestamp('consumed_at'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const deletedAccounts = pgTable('deleted_accounts', {
+  id: serial('id').primaryKey(),
+  uid: text('uid').notNull().unique(),
+  emailHash: text('email_hash').notNull(),
+  deletedAt: timestamp('deleted_at').defaultNow().notNull(),
 });
 
 export const subjects = pgTable('subjects', {
@@ -114,22 +142,28 @@ export const examSessions = pgTable('exam_sessions', {
   completedAt: timestamp('completed_at'),
 });
 
-export const questionAttempts = pgTable('question_attempts', {
-  id: serial('id').primaryKey(),
-  sessionId: integer('session_id')
-    .references(() => examSessions.id, { onDelete: 'cascade' })
-    .notNull(),
-  userUid: text('user_uid').notNull(),
-  questionId: integer('question_id').references(() => questions.id, { onDelete: 'set null' }),
-  subjectId: integer('subject_id'),
-  lectureId: integer('lecture_id'),
-  selectedOption: text('selected_option'), // 'A' | 'B' | 'C' | 'D' | null
-  correctOptionSnapshot: text('correct_option_snapshot').notNull(),
-  isCorrect: boolean('is_correct').notNull().default(false),
-  questionSnapshotJson: text('question_snapshot_json').notNull(),
-  timeSpentSeconds: integer('time_spent_seconds').notNull().default(0),
-  answeredAt: timestamp('answered_at').defaultNow().notNull(),
-});
+export const questionAttempts = pgTable(
+  'question_attempts',
+  {
+    id: serial('id').primaryKey(),
+    sessionId: integer('session_id')
+      .references(() => examSessions.id, { onDelete: 'cascade' })
+      .notNull(),
+    userUid: text('user_uid').notNull(),
+    questionId: integer('question_id').references(() => questions.id, { onDelete: 'set null' }),
+    subjectId: integer('subject_id'),
+    lectureId: integer('lecture_id'),
+    selectedOption: text('selected_option'), // 'A' | 'B' | 'C' | 'D' | null
+    correctOptionSnapshot: text('correct_option_snapshot').notNull(),
+    isCorrect: boolean('is_correct').notNull().default(false),
+    questionSnapshotJson: text('question_snapshot_json').notNull(),
+    timeSpentSeconds: integer('time_spent_seconds').notNull().default(0),
+    answeredAt: timestamp('answered_at').defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('uq_session_question_attempt').on(table.sessionId, table.questionId),
+  ]
+);
 
 export const bookmarks = pgTable('bookmarks', {
   id: serial('id').primaryKey(),

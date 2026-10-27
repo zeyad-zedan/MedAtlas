@@ -1,0 +1,6 @@
+{
+  "name": "MedAtlas MCQ — Medical Education & Examination Platform",
+  "description": "A comprehensive lecture-based medical multiple-choice question (MCQ) learning platform with Study Mode, timed Exam Simulation, Custom Practice, academic analytics, and administrative bulk question management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

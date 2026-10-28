@@ -34,6 +34,7 @@ import {
   setFirebaseOobHandlerForTests,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
+  authenticateEmailUser,
   linkPasswordToAuthenticatedAccount,
   revokeUserSessions,
   deleteUserAccount,
@@ -297,7 +298,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
   });
 
-  it('P2.2 Local-only password reset fails honestly (503) when unconfigured, delivers single-use tokens when configured, and rejects untrusted origins', async () => {
+  it('P2.2 Password reset uses Firebase Auth without webhooks, delivers generic enumeration protection, and verifies trusted origins', async () => {
     const email = `sec.reset.${TEST_RUN_ID}@medatlas.test`;
     const user = await registerEmailPasswordUser(
       email,
@@ -306,31 +307,23 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
     createdUserUids.push(user.uid);
 
-    // 1. When no local email webhook/dispatcher is configured, local-only reset must fail honestly with 503
-    const prevWebhook = process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL;
-    const prevLegacyWebhook = process.env.PASSWORD_RESET_WEBHOOK_URL;
-    delete process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL;
-    delete process.env.PASSWORD_RESET_WEBHOOK_URL;
+    // 1. Verify trusted recovery origins (medatlas.ai.studio, *.ai.studio, *.run.app) are trusted
+    assert.equal(
+      validateTrustedRecoveryOrigin('https://medatlas.ai.studio'),
+      'https://medatlas.ai.studio'
+    );
+    assert.equal(
+      validateTrustedRecoveryOrigin('https://preview-test.ai.studio'),
+      'https://preview-test.ai.studio'
+    );
+    assert.equal(
+      validateTrustedRecoveryOrigin(
+        'https://ais-dev-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
+      ),
+      'https://ais-dev-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
+    );
 
-    try {
-      await assert.rejects(
-        async () => {
-          await requestPasswordRecoveryToken(email, {
-            enforceDeliveryConfigInTest: true,
-          });
-        },
-        (err: any) =>
-          err instanceof ClientSafeError &&
-          err.statusCode === 503 &&
-          /LOCAL_PASSWORD_RESET_WEBHOOK_URL/i.test(err.message)
-      );
-    } finally {
-      if (prevWebhook !== undefined) process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL = prevWebhook;
-      if (prevLegacyWebhook !== undefined)
-        process.env.PASSWORD_RESET_WEBHOOK_URL = prevLegacyWebhook;
-    }
-
-    // 2. Untrusted recovery origin must be rejected with 400
+    // Untrusted recovery origin must be rejected with 400
     await assert.rejects(
       async () => {
         validateTrustedRecoveryOrigin('https://evil-phishing.example.com');
@@ -340,6 +333,27 @@ describe('Security & Reliability Audit Regression Suite', () => {
         err.statusCode === 400 &&
         /untrusted/i.test(err.message)
     );
+
+    // 2. Requesting reset does NOT require LOCAL_PASSWORD_RESET_WEBHOOK_URL and succeeds via Firebase Auth
+    delete process.env.LOCAL_PASSWORD_RESET_WEBHOOK_URL;
+    delete process.env.PASSWORD_RESET_WEBHOOK_URL;
+
+    const fbResetRes = await requestPasswordRecoveryToken(email, {
+      origin: 'https://medatlas.ai.studio',
+      triggerFirebaseEmail: false, // Don't make real outbound network call in unit test
+    });
+    assert.equal(fbResetRes.accepted, true);
+    assert.equal(fbResetRes.deliveryChannel, 'firebase');
+    assert.ok(fbResetRes.message.length > 10);
+
+    // 3. Non-existent email receives the exact same generic confirmation (no enumeration)
+    const nonExistentRes = await requestPasswordRecoveryToken(
+      `unknown.${TEST_RUN_ID}@medatlas.test`,
+      { origin: 'https://medatlas.ai.studio' }
+    );
+    assert.equal(nonExistentRes.accepted, true);
+    assert.equal(nonExistentRes.message, fbResetRes.message);
+    assert.equal(nonExistentRes.deliveryChannel, 'noop');
 
     // 3. Configure local reset email transport and verify end-to-end local recovery flow
     const dispatchedEmails: Array<{
@@ -538,6 +552,64 @@ describe('Security & Reliability Audit Regression Suite', () => {
       verifyPassword('NewFirebaseSyncedPass789!', afterHybridReset.passwordHash),
       true
     );
+  });
+
+  it('P2.4 Untrusted recovery origins are rejected, while medatlas.ai.studio, *.ai.studio, and *.run.app succeed seamlessly', async () => {
+    // Trusted platform origins must succeed
+    assert.equal(
+      validateTrustedRecoveryOrigin('https://medatlas.ai.studio'),
+      'https://medatlas.ai.studio'
+    );
+    assert.equal(
+      validateTrustedRecoveryOrigin('https://preview-test.ai.studio'),
+      'https://preview-test.ai.studio'
+    );
+    assert.equal(
+      validateTrustedRecoveryOrigin(
+        'https://ais-pre-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
+      ),
+      'https://ais-pre-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
+    );
+
+    // Path or query injection in recovery origin must be rejected with 400
+    await assert.rejects(
+      async () => validateTrustedRecoveryOrigin('https://medatlas.ai.studio/path-injection'),
+      (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+    );
+
+    // Untrusted external origin must be rejected with 400
+    await assert.rejects(
+      async () => validateTrustedRecoveryOrigin('https://attacker-phishing.example.com'),
+      (err: any) =>
+        err instanceof ClientSafeError &&
+        err.statusCode === 400 &&
+        /untrusted/i.test(err.message)
+    );
+
+    // End-to-end forgot-password request with origin https://medatlas.ai.studio succeeds
+    const testEmail = `origin.test.${TEST_RUN_ID}@medatlas.test`;
+    const localUser = await registerEmailPasswordUser(
+      testEmail,
+      'OriginSecurePass123!',
+      'Origin Student'
+    );
+    createdUserUids.push(localUser.uid);
+
+    const resetRes = await requestPasswordRecoveryToken(testEmail, {
+      origin: 'https://medatlas.ai.studio',
+      triggerFirebaseEmail: false,
+    });
+    assert.equal(resetRes.accepted, true);
+    assert.equal(resetRes.deliveryChannel, 'firebase');
+
+    // Authenticate email user with local password succeeds
+    const authed = await authenticateEmailUser(testEmail, 'OriginSecurePass123!');
+    assert.ok(authed);
+    assert.equal(authed.email, testEmail);
+
+    // Incorrect password fails
+    const badAuth = await authenticateEmailUser(testEmail, 'WrongPassword123!');
+    assert.equal(badAuth, null);
   });
 
   // ==========================================================================

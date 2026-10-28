@@ -20,6 +20,7 @@ import {
   getOrCreateUser,
   registerEmailPasswordUser,
   findUserByEmail,
+  authenticateEmailUser,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   changeAuthenticatedUserPassword,
@@ -230,12 +231,9 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    const user = await findUserByEmail(String(email));
-    if (!user || !user.passwordHash || !verifyPassword(String(password), user.passwordHash)) {
+    const user = await authenticateEmailUser(String(email), String(password));
+    if (!user) {
       return res.status(401).json({ error: 'Invalid email address or password.' });
-    }
-    if (user.accountStatus !== 'active') {
-      return res.status(403).json({ error: 'This account is suspended or inactive.' });
     }
 
     const token = createServerSessionToken({

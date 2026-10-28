@@ -282,7 +282,9 @@ export function resolveRateLimitStoreConfig(
 
   if (isProd) {
     const warning =
-      '[SECURITY ALERT] Production environment does not have database credentials configured (SQL_HOST/SQL_USER/SQL_DB_NAME or DATABASE_URL). Multi-instance shared rate limiting cannot be activated. Enforcing documented degraded rate-limiting policy (per-instance in-memory storage).';
+      degradedModePolicy === 'fail_closed'
+        ? '[SECURITY ALERT] Production environment does not have database credentials configured (SQL_HOST/SQL_USER/SQL_DB_NAME or DATABASE_URL). Shared rate limiting store is absent and degradedModePolicy is fail_closed: protected endpoints will reject requests with HTTP 503.'
+        : '[SECURITY ALERT] Production environment does not have database credentials configured (SQL_HOST/SQL_USER/SQL_DB_NAME or DATABASE_URL). Multi-instance shared rate limiting cannot be activated. Enforcing documented degraded rate-limiting policy (per-instance in-memory storage only; does NOT provide multi-instance protection).';
     console.error(warning);
     return {
       store: undefined,
@@ -295,7 +297,7 @@ export function resolveRateLimitStoreConfig(
   return {
     store: undefined,
     type: 'memory_local',
-    degradedModePolicy: 'memory_fallback',
+    degradedModePolicy: env.RATE_LIMIT_DEGRADED_POLICY === 'fail_closed' ? 'fail_closed' : 'memory_fallback',
   };
 }
 
@@ -313,7 +315,9 @@ export function createBoundedRateLimiter(
   const maxRequests = Math.max(1, options.maxRequests);
   const maxKeys = Math.max(10, options.maxKeys ?? 5000);
   const scope = options.scope || 'default';
-  const degradedModePolicy = options.degradedModePolicy || 'memory_fallback';
+  const degradedModePolicy: 'memory_fallback' | 'fail_closed' =
+    options.degradedModePolicy ||
+    (process.env.NODE_ENV === 'production' ? 'fail_closed' : 'memory_fallback');
   const errorMessage =
     options.message || 'Too many requests. Please wait a moment and try again.';
 
@@ -484,6 +488,17 @@ export function createBoundedRateLimiter(
 
     // Synchronous path when no async sharedStore is attached
     if (!activeSharedStore) {
+      if (degradedModePolicy === 'fail_closed') {
+        res.setHeader('X-RateLimit-Protection', 'fail-closed-unavailable');
+        res.status(503).json({
+          error: 'Rate limiting service is temporarily unavailable. Please try again shortly.',
+        });
+        return;
+      }
+
+      // Explicit per-instance memory fallback: clearly observable and documented
+      res.setHeader('X-RateLimit-Protection', 'per-instance-only');
+      res.setHeader('X-RateLimit-Degraded-Mode', 'per-instance-memory-fallback');
       const results = rules.map((r) =>
         consumeInMemory(r.key, r.windowMs, r.maxRequests, now)
       );
@@ -508,6 +523,7 @@ export function createBoundedRateLimiter(
           results.push(resItem);
           if (!resItem.allowed) break;
         }
+        res.setHeader('X-RateLimit-Protection', 'multi-instance-shared');
         applyHeadersAndRespond(res, next, results, now);
       } catch (storeErr: any) {
         console.error('Shared rate-limit store error:', {
@@ -515,12 +531,15 @@ export function createBoundedRateLimiter(
           message: storeErr?.message,
         });
         if (degradedModePolicy === 'fail_closed') {
+          res.setHeader('X-RateLimit-Protection', 'fail-closed-unavailable');
           res.status(503).json({
             error: 'Rate limiting service is temporarily unavailable. Please try again shortly.',
           });
           return;
         }
         // Degraded mode: fall back to bounded churn-resistant in-memory store
+        res.setHeader('X-RateLimit-Protection', 'per-instance-only');
+        res.setHeader('X-RateLimit-Degraded-Mode', 'per-instance-memory-fallback');
         const fallbackResults = rules.map((r) =>
           consumeInMemory(r.key, r.windowMs, r.maxRequests, now)
         );

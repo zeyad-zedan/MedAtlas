@@ -2445,7 +2445,55 @@ describe('Security & Reliability Audit Regression Suite', () => {
     }
   });
 
-  it('F1. Activates shared PostgreSQL rate-limit store under configured production database credentials, enforces documented degraded policy when credentials missing, and never makes false multi-instance claims', () => {
+  it('F1. Activates shared PostgreSQL rate-limit store under configured production database credentials, enforces documented degraded policy when credentials missing, and never makes false multi-instance claims', async () => {
+    const invokeLimiterWithContext = async (
+      limiterMiddleware: ReturnType<typeof createBoundedRateLimiter>,
+      options?: { ip?: string; email?: string; headers?: Record<string, string>; uid?: string; path?: string }
+    ) => {
+      const ip = options?.ip || '198.51.100.1';
+      let status = 200;
+      let body: any = null;
+      const headers: Record<string, string> = {};
+      let nextCalled = false;
+
+      const req: any = {
+        ip,
+        body: {
+          ...(options?.email ? { email: options.email } : {}),
+        },
+        headers: options?.headers || {},
+        socket: { remoteAddress: ip },
+        baseUrl: '',
+        path: options?.path || '/api/auth/test',
+        user: options?.uid ? { uid: options.uid } : undefined,
+        app: { get: () => false },
+      };
+
+      const res: any = {
+        setHeader(name: string, value: string) {
+          headers[name.toLowerCase()] = String(value);
+          return this;
+        },
+        getHeader(name: string) {
+          return headers[name.toLowerCase()];
+        },
+        status(c: number) {
+          status = c;
+          return this;
+        },
+        json(payload: any) {
+          body = payload;
+          return this;
+        },
+      };
+
+      await limiterMiddleware(req, res, () => {
+        nextCalled = true;
+      });
+
+      return { status, body, headers, nextCalled };
+    };
+
     // 1. Configured production database credentials (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) activate shared store
     const prodConfiguredEnv: NodeJS.ProcessEnv = {
       NODE_ENV: 'production',
@@ -2470,7 +2518,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(dbUrlResolution.type, 'shared_postgres');
     assert.ok(dbUrlResolution.store !== undefined);
 
-    // 3. Unconfigured production environment invokes documented degraded policy (memory_fallback, fail_closed) with explicit alert
+    // 3. Unconfigured production environment resolves degraded policy fail_closed with security alert
     const prodMissingEnv: NodeJS.ProcessEnv = {
       NODE_ENV: 'production',
     };
@@ -2481,14 +2529,124 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.equal(missingResolution.degradedModePolicy, 'fail_closed');
     assert.ok(missingResolution.warning?.includes('SECURITY ALERT'), 'Must log explicit security alert in production');
 
-    // 4. Non-production without DB uses local in-memory store
-    const devMissingEnv: NodeJS.ProcessEnv = {
-      NODE_ENV: 'development',
+    // 4. Production with no database configuration and fail_closed rejects requests with HTTP 503
+    const prodMissingLimiter = createBoundedRateLimiter({
+      scope: `prod-fail-closed-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 5,
+      store: undefined,
+      degradedModePolicy: 'fail_closed',
+    });
+    const res2 = await invokeLimiterWithContext(prodMissingLimiter);
+    assert.equal(res2.status, 503);
+    assert.equal(res2.nextCalled, false, 'Requests must NOT pass through when store missing under fail_closed');
+    assert.equal(res2.headers['x-ratelimit-protection'], 'fail-closed-unavailable');
+    assert.match(res2.body?.error || '', /unavailable/i);
+
+    // 5. Production with a shared store that throws also returns HTTP 503 under fail_closed
+    const throwingStore = {
+      consume: async () => {
+        throw new Error('Database pool connection timeout');
+      },
+      pruneExpired: async () => 0,
     };
-    const devResolution = resolveRateLimitStoreConfig(devMissingEnv);
+    const throwingLimiter = createBoundedRateLimiter({
+      scope: `prod-throwing-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 5,
+      store: throwingStore,
+      degradedModePolicy: 'fail_closed',
+    });
+    const res3 = await invokeLimiterWithContext(throwingLimiter);
+    assert.equal(res3.status, 503);
+    assert.equal(res3.nextCalled, false, 'Requests must NOT pass through when shared store throws under fail_closed');
+    assert.equal(res3.headers['x-ratelimit-protection'], 'fail-closed-unavailable');
+
+    // 6. Explicitly configured memory_fallback behaves as documented and never claims multi-instance protection
+    const memoryFallbackLimiter = createBoundedRateLimiter({
+      scope: `prod-mem-fallback-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 5,
+      store: undefined,
+      degradedModePolicy: 'memory_fallback',
+    });
+    const res4 = await invokeLimiterWithContext(memoryFallbackLimiter);
+    assert.equal(res4.status, 200);
+    assert.equal(res4.nextCalled, true);
+    assert.equal(res4.headers['x-ratelimit-protection'], 'per-instance-only');
+    assert.equal(res4.headers['x-ratelimit-degraded-mode'], 'per-instance-memory-fallback');
+    assert.notEqual(res4.headers['x-ratelimit-protection'], 'multi-instance-shared');
+
+    // 7. Development and test behavior remains compatible
+    const devEnv: NodeJS.ProcessEnv = { NODE_ENV: 'development' };
+    const devResolution = resolveRateLimitStoreConfig(devEnv);
     assert.equal(devResolution.type, 'memory_local');
     assert.equal(devResolution.store, undefined);
     assert.equal(devResolution.degradedModePolicy, 'memory_fallback');
+
+    const devLimiter = createBoundedRateLimiter({
+      scope: `dev-compat-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 5,
+      store: devResolution.store,
+      degradedModePolicy: devResolution.degradedModePolicy,
+    });
+    const res5 = await invokeLimiterWithContext(devLimiter);
+    assert.equal(res5.status, 200);
+    assert.equal(res5.nextCalled, true);
+
+    // 8. Authentication and password-recovery routes enforce configured fail_closed policy
+    const prodNoDbResolution = resolveRateLimitStoreConfig({ NODE_ENV: 'production' });
+    assert.equal(prodNoDbResolution.degradedModePolicy, 'fail_closed');
+
+    const testRegisterLimiter = createBoundedRateLimiter({
+      scope: 'auth-register',
+      maxRequests: 15,
+      windowMs: 60_000,
+      store: prodNoDbResolution.store,
+      degradedModePolicy: prodNoDbResolution.degradedModePolicy,
+    });
+    const testLoginLimiter = createBoundedRateLimiter({
+      scope: 'auth-login',
+      maxRequests: 15,
+      windowMs: 60_000,
+      store: prodNoDbResolution.store,
+      degradedModePolicy: prodNoDbResolution.degradedModePolicy,
+    });
+    const testForgotPasswordLimiter = createBoundedRateLimiter({
+      scope: 'auth-forgot-password',
+      maxRequests: 6,
+      windowMs: 60_000,
+      store: prodNoDbResolution.store,
+      degradedModePolicy: prodNoDbResolution.degradedModePolicy,
+    });
+    const testResetPasswordLimiter = createBoundedRateLimiter({
+      scope: 'auth-reset-password',
+      maxRequests: 10,
+      windowMs: 60_000,
+      store: prodNoDbResolution.store,
+      degradedModePolicy: prodNoDbResolution.degradedModePolicy,
+    });
+    const testPasswordMutationLimiter = createBoundedRateLimiter({
+      scope: 'auth-password-mutation',
+      maxRequests: 10,
+      windowMs: 60_000,
+      store: prodNoDbResolution.store,
+      degradedModePolicy: prodNoDbResolution.degradedModePolicy,
+    });
+
+    for (const [name, limiter] of [
+      ['registerLimiter', testRegisterLimiter],
+      ['loginLimiter', testLoginLimiter],
+      ['forgotPasswordLimiter', testForgotPasswordLimiter],
+      ['resetPasswordLimiter', testResetPasswordLimiter],
+      ['passwordMutationLimiter', testPasswordMutationLimiter],
+    ] as const) {
+      const routeRes = await invokeLimiterWithContext(limiter);
+      assert.equal(routeRes.status, 503, `${name} must reject with 503 when production store is absent under fail_closed`);
+      assert.equal(routeRes.nextCalled, false, `${name} must not allow request through`);
+      assert.equal(routeRes.headers['x-ratelimit-protection'], 'fail-closed-unavailable');
+    }
   });
 
   it('F2. Resolves authoritative provider identities without UID prefix guessing across local, Firebase, linked, and arbitrary non-prefix UIDs', async () => {
@@ -2718,5 +2876,119 @@ describe('Security & Reliability Audit Regression Suite', () => {
       await db.delete(users).where(eq(users.uid, userUid)).catch(() => {});
     }
   });
+
+  it('F4. Database-token password recovery enforces Firebase synchronization with requireSuccess: true, prevents inconsistent credentials, and rejects localEmailTransport in production', async () => {
+    // 1. localEmailTransport is strictly rejected in production
+    const prodEmail = `prod.transport.${TEST_RUN_ID}@medatlas.test`;
+    const prodUser = await registerEmailPasswordUser(prodEmail, 'Pass123!Secure', 'Prod User');
+    createdUserUids.push(prodUser.uid);
+
+    const prevEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      await assert.rejects(
+        async () =>
+          requestPasswordRecoveryToken(prodEmail, {
+            localEmailTransport: async () => {},
+          }),
+        (err: any) =>
+          err instanceof ClientSafeError &&
+          err.statusCode === 400 &&
+          /forbidden in production/i.test(err.message)
+      );
+    } finally {
+      process.env.NODE_ENV = prevEnv;
+    }
+
+    // 2. Database-token reset for an account linked to Firebase:
+    // If Firebase synchronization fails, it MUST fail closed (503), NOT consume the token, and NOT modify PostgreSQL!
+    const suffix = crypto.randomBytes(4).toString('hex');
+    const linkedEmail = `f4.recovery.${suffix}@test.medatlas.internal`;
+    const linkedUserUid = `usr_f4_${suffix}`;
+    const linkedFbUid = `fb_f4_${suffix}`;
+    const initialPass = 'InitialLinkedPass123!';
+    const initialHash = await hashPasswordAsync(initialPass);
+
+    await db.insert(users).values({
+      uid: linkedUserUid,
+      firebaseUid: linkedFbUid,
+      email: linkedEmail,
+      displayName: 'F4 Linked Student',
+      passwordHash: initialHash,
+      authProvider: 'both',
+      accountStatus: 'active',
+      role: 'student',
+      tokenVersion: 1,
+      passwordUpdatedAt: new Date(),
+    });
+
+    const recoveryRawToken = crypto.randomBytes(32).toString('hex');
+    const recoveryTokenHash = hashRecoveryToken(recoveryRawToken);
+    const [insertedToken] = await db
+      .insert(passwordResetTokens)
+      .values({
+        userUid: linkedUserUid,
+        tokenHash: recoveryTokenHash,
+        expiresAt: new Date(Date.now() + 15 * 60 * 1000),
+      })
+      .returning();
+
+    const attemptedNewPass = 'AttemptedNewPass456!';
+
+    // Simulate Firebase provider update failure
+    setFirebasePasswordUpdateHandlerForTests(async () => false);
+
+    try {
+      await assert.rejects(
+        async () => confirmPasswordRecoveryToken(recoveryRawToken, attemptedNewPass),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 503
+      );
+
+      // Verify token was NOT consumed
+      const [tokenAfterFail] = await db
+        .select()
+        .from(passwordResetTokens)
+        .where(eq(passwordResetTokens.id, insertedToken.id));
+      assert.equal(tokenAfterFail.consumedAt, null, 'Token must NOT be consumed when provider sync fails');
+
+      // Verify PostgreSQL credentials were NOT modified
+      const [userAfterFail] = await db
+        .select()
+        .from(users)
+        .where(eq(users.uid, linkedUserUid));
+      assert.equal(userAfterFail.tokenVersion, 1);
+      assert.equal(verifyPassword(initialPass, userAfterFail.passwordHash!), true);
+      assert.equal(verifyPassword(attemptedNewPass, userAfterFail.passwordHash!), false);
+
+      // Now simulate Firebase provider update SUCCESS
+      setFirebasePasswordUpdateHandlerForTests(async (params) => {
+        return params.newPassword === attemptedNewPass;
+      });
+
+      const resetResult = await confirmPasswordRecoveryToken(recoveryRawToken, attemptedNewPass);
+      assert.ok(resetResult);
+      assert.equal(resetResult.tokenVersion, 2);
+
+      // Token IS consumed now
+      const [tokenAfterSuccess] = await db
+        .select()
+        .from(passwordResetTokens)
+        .where(eq(passwordResetTokens.id, insertedToken.id));
+      assert.ok(tokenAfterSuccess.consumedAt !== null, 'Token must be consumed on successful reset');
+
+      // Credentials are fully synchronized
+      const [userAfterSuccess] = await db
+        .select()
+        .from(users)
+        .where(eq(users.uid, linkedUserUid));
+      assert.equal(verifyPassword(initialPass, userAfterSuccess.passwordHash!), false);
+      assert.equal(verifyPassword(attemptedNewPass, userAfterSuccess.passwordHash!), true);
+    } finally {
+      setFirebasePasswordUpdateHandlerForTests(null);
+      await db.delete(passwordResetTokens).where(eq(passwordResetTokens.userUid, linkedUserUid)).catch(() => {});
+      await db.delete(users).where(eq(users.uid, linkedUserUid)).catch(() => {});
+    }
+  });
 });
+
 

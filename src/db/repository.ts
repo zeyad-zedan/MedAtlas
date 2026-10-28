@@ -1538,6 +1538,12 @@ export async function requestPasswordRecoveryToken(
     // 1. If explicit custom localEmailTransport is provided (for deterministic unit testing of local tokens),
     // execute the single-use database token lifecycle.
     if (options?.localEmailTransport) {
+      if (process.env.NODE_ENV === 'production') {
+        throw new ClientSafeError(
+          'Custom email transport is forbidden in production.',
+          400
+        );
+      }
       const { rawToken, tokenHash, expiresAt } = generateRecoveryToken();
 
       const insertedTokenId = await db.transaction(async (tx) => {
@@ -1725,98 +1731,138 @@ export async function confirmPasswordRecoveryToken(
       .where(eq(passwordResetTokens.tokenHash, tokenHash));
 
     if (existingTokenRows.length > 0 || /^[a-f0-9]{64}$/i.test(cleanedToken)) {
-      const updatedUser = await db.transaction(async (tx) => {
-        const tokenRows = await tx
+      // 1. Look up the token record and user to inspect target identity
+      const tokenRecord = existingTokenRows[0] || (
+        await db
           .select()
           .from(passwordResetTokens)
-          .where(eq(passwordResetTokens.tokenHash, tokenHash));
+          .where(eq(passwordResetTokens.tokenHash, tokenHash))
+      )[0];
 
-        const tokenRecord = tokenRows[0];
-        if (
-          !tokenRecord ||
-          tokenRecord.consumedAt !== null ||
-          new Date(tokenRecord.expiresAt).getTime() <= now.getTime()
-        ) {
+      if (
+        !tokenRecord ||
+        tokenRecord.consumedAt !== null ||
+        new Date(tokenRecord.expiresAt).getTime() <= now.getTime()
+      ) {
+        throw new ClientSafeError(
+          'Invalid, expired, or already used password recovery token.',
+          400
+        );
+      }
+
+      const preUserRows = await db
+        .select()
+        .from(users)
+        .where(eq(users.uid, tokenRecord.userUid));
+      const targetUser = preUserRows[0];
+      if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
+        throw new ClientSafeError('Account is no longer active.', 400);
+      }
+
+      // 2. If the user has a linked Firebase identity, synchronize to Firebase provider FIRST.
+      // Must requireSuccess: true so we NEVER report success or update PostgreSQL if Firebase sync fails!
+      const targetFbUid = resolveUserFirebaseUid(targetUser);
+      let providerSynced = false;
+      if (targetFbUid) {
+        providerSynced = await syncPasswordToFirebaseProvider({
+          uid: targetUser.uid,
+          firebaseUid: targetFbUid,
+          authProvider: targetUser.authProvider,
+          email: targetUser.email,
+          newPassword,
+          requireSuccess: true,
+        });
+
+        if (!providerSynced) {
           throw new ClientSafeError(
-            'Invalid, expired, or already used password recovery token.',
-            400
+            'Unable to synchronize password reset with authentication provider. Please try again shortly.',
+            503
           );
         }
+      }
 
-        // Atomic conditional consumption so concurrent requests with the same token cannot both succeed
-        const consumedRows = await tx
-          .update(passwordResetTokens)
-          .set({ consumedAt: now })
-          .where(
-            and(
-              eq(passwordResetTokens.id, tokenRecord.id),
-              isNull(passwordResetTokens.consumedAt)
+      // 3. Atomically consume the token and update PostgreSQL credentials
+      let updatedUser: (typeof users.$inferSelect) | undefined;
+      try {
+        updatedUser = await db.transaction(async (tx) => {
+          const consumedRows = await tx
+            .update(passwordResetTokens)
+            .set({ consumedAt: now })
+            .where(
+              and(
+                eq(passwordResetTokens.id, tokenRecord.id),
+                isNull(passwordResetTokens.consumedAt)
+              )
             )
-          )
-          .returning();
+            .returning();
 
-        if (consumedRows.length === 0) {
-          throw new ClientSafeError(
-            'Invalid, expired, or already used password recovery token.',
-            400
-          );
+          if (consumedRows.length === 0) {
+            throw new ClientSafeError(
+              'Invalid, expired, or already used password recovery token.',
+              400
+            );
+          }
+
+          // Invalidate any other outstanding recovery tokens for this user
+          await tx
+            .update(passwordResetTokens)
+            .set({ consumedAt: now })
+            .where(
+              and(
+                eq(passwordResetTokens.userUid, tokenRecord.userUid),
+                isNull(passwordResetTokens.consumedAt)
+              )
+            );
+
+          const nextProvider =
+            targetUser.authProvider === 'firebase' || targetUser.authProvider === 'local'
+              ? 'both'
+              : targetUser.authProvider;
+
+          const [updated] = await tx
+            .update(users)
+            .set({
+              passwordHash: newPasswordHash,
+              authProvider: nextProvider,
+              passwordUpdatedAt: now,
+              pendingRecoveryAt: null,
+              sessionsRevokedAt: now,
+              tokenVersion: sql`${users.tokenVersion} + 1`,
+              updatedAt: now,
+            })
+            .where(eq(users.uid, targetUser.uid))
+            .returning();
+
+          return updated;
+        });
+      } catch (dbErr: any) {
+        if (targetFbUid && providerSynced) {
+          // Compensating defensive invalidation: Firebase was updated to newPassword, but DB commit failed.
+          // Invalidate local passwordHash and mark pendingRecoveryAt so old password cannot authenticate.
+          try {
+            await db
+              .update(users)
+              .set({
+                passwordHash: null,
+                pendingRecoveryAt: now,
+                sessionsRevokedAt: now,
+                tokenVersion: sql`${users.tokenVersion} + 1`,
+                updatedAt: now,
+              })
+              .where(eq(users.uid, targetUser.uid));
+            recordUserSessionRevocation(targetUser.uid, now.getTime());
+            recordUserSessionRevocation(targetFbUid, now.getTime());
+          } catch (defensiveErr) {
+            console.error('Defensive invalidation after DB reset failure failed:', defensiveErr);
+          }
         }
-
-        // Invalidate any other outstanding recovery tokens for this user
-        await tx
-          .update(passwordResetTokens)
-          .set({ consumedAt: now })
-          .where(
-            and(
-              eq(passwordResetTokens.userUid, tokenRecord.userUid),
-              isNull(passwordResetTokens.consumedAt)
-            )
-          );
-
-        const userRows = await tx
-          .select()
-          .from(users)
-          .where(eq(users.uid, tokenRecord.userUid));
-        const targetUser = userRows[0];
-
-        if (!targetUser || targetUser.accountStatus !== 'active' || targetUser.deletedAt !== null) {
-          throw new ClientSafeError('Account is no longer active.', 400);
-        }
-
-        const nextProvider =
-          targetUser.authProvider === 'firebase' || targetUser.authProvider === 'local'
-            ? 'both'
-            : targetUser.authProvider;
-
-        const [updated] = await tx
-          .update(users)
-          .set({
-            passwordHash: newPasswordHash,
-            authProvider: nextProvider,
-            passwordUpdatedAt: now,
-            pendingRecoveryAt: null,
-            sessionsRevokedAt: now,
-            tokenVersion: sql`${users.tokenVersion} + 1`,
-            updatedAt: now,
-          })
-          .where(eq(users.uid, targetUser.uid))
-          .returning();
-
-        return updated;
-      });
+        throw dbErr;
+      }
 
       recordUserSessionRevocation(updatedUser.uid, now.getTime());
       if (updatedUser.firebaseUid) {
         recordUserSessionRevocation(updatedUser.firebaseUid, now.getTime());
       }
-
-      await syncPasswordToFirebaseProvider({
-        uid: updatedUser.uid,
-        firebaseUid: updatedUser.firebaseUid,
-        email: updatedUser.email,
-        newPassword,
-        requireSuccess: false,
-      });
 
       return sanitizeUserForClient(updatedUser);
     }

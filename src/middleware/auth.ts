@@ -190,32 +190,6 @@ export function generateRecoveryToken(): {
   return { rawToken, tokenHash, expiresAt };
 }
 
-export const SIX_DIGIT_CODE_TTL_MS = 1000 * 60 * 10; // 10 minutes
-
-/**
- * Generates a cryptographically secure 6-digit numeric verification code (100000 - 999999).
- */
-export function generateSixDigitCode(): string {
-  const codeNum = crypto.randomInt(100000, 1000000);
-  return codeNum.toString();
-}
-
-/**
- * Securely hashes a 6-digit recovery code using HMAC-SHA256 keyed with AUTH_SESSION_SECRET
- * and salted with the user's permanent unique identifier (userUid).
- * Because 6-digit numbers have 10^6 possible values, keyed HMAC + user salt completely
- * prevents offline precomputation and rainbow table attacks.
- */
-export function hashSixDigitCode(code: string, userUid: string, secretOverride?: string): string {
-  const secret = getSessionSecret(secretOverride);
-  const normalizedCode = String(code || '').trim();
-  const normalizedUid = String(userUid || '').trim();
-  return crypto
-    .createHmac('sha256', secret)
-    .update(`${normalizedUid}:${normalizedCode}`)
-    .digest('hex');
-}
-
 export interface ServerSessionTokenOptions {
   ttlMs?: number;
   secret?: string;

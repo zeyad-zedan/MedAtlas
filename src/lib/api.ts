@@ -149,37 +149,17 @@ export const api = {
       accepted: boolean;
       message: string;
       expiresInMinutes: number;
-      cooldownSeconds?: number;
     }>('/api/auth/forgot-password', {
       method: 'POST',
       body: JSON.stringify({ email, origin }),
     });
   },
 
-  verifyRecoveryCode: async (email: string, code: string) => {
-    return apiRequest<{ valid: boolean }>('/api/auth/verify-code', {
+  confirmPasswordReset: (token: string, newPassword: string) =>
+    apiRequest<{ message: string }>('/api/auth/reset-password', {
       method: 'POST',
-      body: JSON.stringify({ email, code }),
-    });
-  },
-
-  confirmPasswordReset: (
-    target:
-      | string
-      | { email?: string; code?: string; token?: string; newPassword?: string },
-    optionalPassword?: string
-  ) => {
-    let payload: Record<string, any>;
-    if (typeof target === 'string') {
-      payload = { token: target, newPassword: optionalPassword };
-    } else {
-      payload = target;
-    }
-    return apiRequest<{ message: string }>('/api/auth/reset-password', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-  },
+      body: JSON.stringify({ token, newPassword }),
+    }),
 
   changePassword: async (currentPassword: string, newPassword: string) => {
     const data = await apiRequest<{

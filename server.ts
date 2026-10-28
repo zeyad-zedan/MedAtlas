@@ -22,10 +22,6 @@ import {
   findUserByEmail,
   authenticateEmailUser,
   requestPasswordRecoveryToken,
-  requestPasswordRecoveryCode,
-  verifyPasswordRecoveryCode,
-  confirmPasswordRecoveryCode,
-  confirmPasswordRecoveryWithCode,
   confirmPasswordRecoveryToken,
   changeAuthenticatedUserPassword,
   linkPasswordToAuthenticatedAccount,
@@ -258,11 +254,11 @@ app.post('/api/auth/login', loginLimiter, async (req, res) => {
 });
 
 /**
- * Step 1 of Password Recovery: Request a 6-digit verification code (or legacy token).
+ * Step 1 of Password Recovery: Request an account-aware password reset email / token.
  */
 app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) => {
   try {
-    const { email, origin, mode, useFirebaseToken } = req.body || {};
+    const { email, origin } = req.body || {};
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res
         .status(400)
@@ -272,26 +268,13 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
       typeof origin === 'string' && origin.trim().length > 0
         ? origin.trim()
         : undefined;
-
-    if (mode === 'legacy' || useFirebaseToken === true) {
-      const result = await requestPasswordRecoveryToken(email, {
-        origin: candidateOrigin,
-      });
-      return res.json({
-        accepted: result.accepted,
-        message: result.message,
-        expiresInMinutes: result.expiresInMinutes,
-      });
-    }
-
-    const result = await requestPasswordRecoveryCode(email, {
+    const result = await requestPasswordRecoveryToken(email, {
       origin: candidateOrigin,
     });
     return res.json({
       accepted: result.accepted,
       message: result.message,
       expiresInMinutes: result.expiresInMinutes,
-      cooldownSeconds: result.cooldownSeconds,
     });
   } catch (error) {
     return sendErrorResponse(
@@ -304,59 +287,13 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
 });
 
 /**
- * Step 2a: Validates a 6-digit verification code without changing credentials.
- * Provides immediate feedback on the website before password entry.
- */
-app.post('/api/auth/verify-code', resetPasswordLimiter, async (req, res) => {
-  try {
-    const { email, code } = req.body || {};
-    if (!email || typeof email !== 'string' || !email.includes('@')) {
-      return res
-        .status(400)
-        .json({ error: 'Please enter a valid account email address.' });
-    }
-    if (!code || typeof code !== 'string' || !/^\d{6}$/.test(code.trim())) {
-      return res
-        .status(400)
-        .json({ error: 'Please enter a valid 6-digit numeric verification code.' });
-    }
-
-    const result = await verifyPasswordRecoveryCode(email.trim(), code.trim());
-    return res.json(result);
-  } catch (error) {
-    return sendErrorResponse(res, error, 'Verification failed.', 400);
-  }
-});
-
-/**
- * Step 2b: Complete password reset using a verified 6-digit code or single-use recovery token.
+ * Step 2 of Password Recovery: Complete password reset using a verified single-use recovery token
+ * or a Firebase Authentication password-reset oobCode.
  * Unauthenticated reset by { email, newPassword } alone is strictly rejected.
  */
 app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
   try {
-    const { email, code, token, oobCode, newPassword } = req.body || {};
-
-    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
-      return res
-        .status(400)
-        .json({ error: 'New password must be at least 8 characters long.' });
-    }
-
-    // 1. 6-digit verification code flow
-    if (code && typeof code === 'string' && /^\d{6}$/.test(code.trim())) {
-      if (!email || typeof email !== 'string' || !email.includes('@')) {
-        return res.status(400).json({
-          error: 'Account email address is required when resetting password with a verification code.',
-        });
-      }
-      await confirmPasswordRecoveryWithCode(email.trim(), code.trim(), newPassword);
-      return res.json({
-        message:
-          'Your password has been updated and prior sessions have been revoked. You may now sign in with your new password.',
-      });
-    }
-
-    // 2. Legacy single-use recovery token or Firebase reset oobCode flow
+    const { token, oobCode, newPassword } = req.body || {};
     const recoverySecret =
       typeof token === 'string' && token.trim().length > 0
         ? token.trim()
@@ -367,8 +304,13 @@ app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
     if (!recoverySecret || recoverySecret.length < 20) {
       return res.status(400).json({
         error:
-          'A valid 6-digit verification code or recovery token is required to reset a password.',
+          'A valid single-use password recovery token or Firebase reset code is required to reset a password.',
       });
+    }
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+      return res
+        .status(400)
+        .json({ error: 'New password must be at least 8 characters long.' });
     }
 
     await confirmPasswordRecoveryToken(recoverySecret, newPassword);

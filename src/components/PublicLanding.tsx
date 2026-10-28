@@ -37,12 +37,9 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [confirmPassword, setConfirmPassword] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [sixDigitCode, setSixDigitCode] = useState('');
   const [recoveryToken, setRecoveryToken] = useState('');
   const [resetStep, setResetStep] = useState<'request' | 'confirm'>('request');
-  const [resendCountdown, setResendCountdown] = useState(0);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
@@ -71,40 +68,13 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
     }
   }, []);
 
-  // 60-second resend cooldown timer
-  useEffect(() => {
-    if (resendCountdown <= 0) return;
-    const interval = setInterval(() => {
-      setResendCountdown((prev) => (prev > 0 ? prev - 1 : 0));
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [resendCountdown]);
-
   const openAuth = (tab: AuthTab) => {
     setAuthTab(tab);
     setResetStep('request');
-    setSixDigitCode('');
     setRecoveryToken('');
-    setPassword('');
-    setConfirmPassword('');
     setAuthError(null);
     setAuthSuccess(null);
     setAuthModalOpen(true);
-  };
-
-  const handleResendCode = async () => {
-    if (resendCountdown > 0 || !email) return;
-    setAuthLoading(true);
-    setAuthError(null);
-    try {
-      const res = await api.requestPasswordReset(email);
-      setAuthSuccess(res.message);
-      setResendCountdown(res.cooldownSeconds || 60);
-    } catch (err: any) {
-      setAuthError(err.message || 'Failed to resend verification code.');
-    } finally {
-      setAuthLoading(false);
-    }
   };
 
   const handleEmailAuth = async (e: React.FormEvent) => {
@@ -126,42 +96,13 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
           const res = await api.requestPasswordReset(email);
           setAuthSuccess(res.message);
           setResetStep('confirm');
-          setResendCountdown(res.cooldownSeconds || 60);
         } else {
-          // Confirm step
-          if (password !== confirmPassword) {
-            setAuthError('New password and confirmation password do not match.');
-            return;
-          }
-          if (password.length < 8) {
-            setAuthError('New password must be at least 8 characters long.');
-            return;
-          }
-
-          if (sixDigitCode.trim()) {
-            const res = await api.confirmPasswordReset({
-              email: email.trim(),
-              code: sixDigitCode.trim(),
-              newPassword: password,
-            });
-            setAuthSuccess(res.message);
-            setSixDigitCode('');
-            setPassword('');
-            setConfirmPassword('');
-            setResetStep('request');
-            setAuthTab('login');
-          } else if (recoveryToken.trim()) {
-            const res = await api.confirmPasswordReset(recoveryToken, password);
-            setAuthSuccess(res.message);
-            setRecoveryToken('');
-            setPassword('');
-            setConfirmPassword('');
-            setResetStep('request');
-            setAuthTab('login');
-          } else {
-            setAuthError('Please enter the 6-digit verification code sent to your email.');
-            return;
-          }
+          const res = await api.confirmPasswordReset(recoveryToken, password);
+          setAuthSuccess(res.message);
+          setRecoveryToken('');
+          setPassword('');
+          setResetStep('request');
+          setAuthTab('login');
         }
       }
     } catch (err: any) {
@@ -780,126 +721,45 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
               )}
 
               {authTab === 'reset' && resetStep === 'confirm' && (
-                <div className="space-y-4">
-                  <div className="flex items-center justify-between p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs">
-                    <span className="text-slate-600 truncate">
-                      Code sent to <strong>{email || 'your email'}</strong>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setResetStep('request');
-                        setAuthError(null);
-                      }}
-                      className="text-[#0284C7] hover:underline font-medium ml-2 shrink-0 cursor-pointer"
-                    >
-                      Change
-                    </button>
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="auth-six-digit-code"
-                      className="block text-xs font-semibold text-slate-700 mb-1"
-                    >
-                      6-Digit Verification Code
-                    </label>
-                    <input
-                      id="auth-six-digit-code"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      maxLength={6}
-                      required={!recoveryToken}
-                      value={sixDigitCode}
-                      onChange={(e) => {
-                        const digits = e.target.value.replace(/\D/g, '').slice(0, 6);
-                        setSixDigitCode(digits);
-                      }}
-                      placeholder="••••••"
-                      className="w-full px-3 py-2 text-center text-2xl font-mono-tabular font-bold tracking-[0.35em] rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7] bg-white text-slate-900"
-                    />
-                    <div className="flex items-center justify-between text-xs text-slate-500 mt-1.5 px-0.5">
-                      <span>Expires in 10 minutes</span>
-                      {resendCountdown > 0 ? (
-                        <span className="text-slate-400 font-mono-tabular">
-                          Resend code in {resendCountdown}s
-                        </span>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={handleResendCode}
-                          disabled={authLoading}
-                          className="text-[#0284C7] hover:underline font-medium cursor-pointer"
-                        >
-                          Resend code
-                        </button>
-                      )}
-                    </div>
-                  </div>
-
-                  {recoveryToken && (
-                    <div>
-                      <label
-                        htmlFor="auth-recovery-token"
-                        className="block text-xs font-semibold text-slate-700 mb-1"
-                      >
-                        Legacy Recovery Token / Link Code
-                      </label>
-                      <input
-                        id="auth-recovery-token"
-                        type="text"
-                        value={recoveryToken}
-                        onChange={(e) => setRecoveryToken(e.target.value)}
-                        className="w-full px-3 py-1.5 text-xs font-mono-tabular rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
-                      />
-                    </div>
-                  )}
+                <div>
+                  <label
+                    htmlFor="auth-recovery-token"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    Recovery Code / Single-Use Reset Token
+                  </label>
+                  <input
+                    id="auth-recovery-token"
+                    type="text"
+                    required
+                    minLength={20}
+                    value={recoveryToken}
+                    onChange={(e) => setRecoveryToken(e.target.value)}
+                    placeholder="Paste your recovery token or reset code"
+                    className="w-full px-3 py-2 text-sm font-mono-tabular rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
                 </div>
               )}
 
               {(authTab !== 'reset' || resetStep === 'confirm') && (
-                <>
-                  <div>
-                    <label
-                      htmlFor="auth-password"
-                      className="block text-xs font-semibold text-slate-700 mb-1"
-                    >
-                      {authTab === 'reset' ? 'New Password (min 8 characters)' : 'Password'}
-                    </label>
-                    <input
-                      id="auth-password"
-                      type="password"
-                      required
-                      minLength={8}
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      placeholder="••••••••"
-                      className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
-                    />
-                  </div>
-
-                  {authTab === 'reset' && resetStep === 'confirm' && (
-                    <div>
-                      <label
-                        htmlFor="auth-confirm-password"
-                        className="block text-xs font-semibold text-slate-700 mb-1"
-                      >
-                        Confirm New Password
-                      </label>
-                      <input
-                        id="auth-confirm-password"
-                        type="password"
-                        required
-                        minLength={8}
-                        value={confirmPassword}
-                        onChange={(e) => setConfirmPassword(e.target.value)}
-                        placeholder="••••••••"
-                        className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
-                      />
-                    </div>
-                  )}
-                </>
+                <div>
+                  <label
+                    htmlFor="auth-password"
+                    className="block text-xs font-semibold text-slate-700 mb-1"
+                  >
+                    {authTab === 'reset' ? 'New Password (min 8 characters)' : 'Password'}
+                  </label>
+                  <input
+                    id="auth-password"
+                    type="password"
+                    required
+                    minLength={8}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="••••••••"
+                    className="w-full px-3 py-2 text-sm rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
+                  />
+                </div>
               )}
 
               <button
@@ -914,8 +774,8 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                   : authTab === 'register'
                   ? 'Create Student Account'
                   : resetStep === 'request'
-                  ? 'Send 6-Digit Code'
-                  : 'Verify Code & Set New Password'}
+                  ? 'Send Password Reset Email'
+                  : 'Verify Token & Update Password'}
               </button>
 
               {authTab === 'reset' && (
@@ -929,7 +789,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                       }}
                       className="text-[#0284C7] hover:underline font-medium cursor-pointer"
                     >
-                      Already have a 6-digit code? Enter it here →
+                      Already have a recovery token? Enter it here →
                     </button>
                   ) : (
                     <button
@@ -940,7 +800,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                       }}
                       className="text-slate-600 hover:text-slate-900 font-medium cursor-pointer"
                     >
-                      ← Back to request code
+                      ← Back to request password reset email
                     </button>
                   )}
                 </div>

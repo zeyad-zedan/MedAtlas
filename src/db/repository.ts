@@ -604,6 +604,31 @@ async function deliverLocalPasswordResetEmail(
   }
 }
 
+export type FirebaseProvisioningHandlerForTests = (
+  email: string,
+  displayName?: string
+) => Promise<boolean>;
+
+export type FirebaseEmailDispatchHandlerForTests = (
+  email: string,
+  continueUrl?: string
+) => Promise<boolean>;
+
+let customFirebaseProvisioningForTests: FirebaseProvisioningHandlerForTests | null = null;
+let customFirebaseEmailDispatchForTests: FirebaseEmailDispatchHandlerForTests | null = null;
+
+export function setFirebaseProvisioningHandlerForTests(
+  handler: FirebaseProvisioningHandlerForTests | null
+): void {
+  customFirebaseProvisioningForTests = handler;
+}
+
+export function setFirebaseEmailDispatchHandlerForTests(
+  handler: FirebaseEmailDispatchHandlerForTests | null
+): void {
+  customFirebaseEmailDispatchForTests = handler;
+}
+
 /**
  * Dispatches a password-reset email using the configured Firebase Authentication project
  * (Identity Toolkit accounts:sendOobCode API).
@@ -612,6 +637,10 @@ export async function dispatchFirebasePasswordResetEmail(
   email: string,
   continueUrl?: string
 ): Promise<boolean> {
+  if (customFirebaseEmailDispatchForTests) {
+    return customFirebaseEmailDispatchForTests(email, continueUrl);
+  }
+
   const apiKey = firebaseConfig?.apiKey?.trim();
   if (!apiKey) return false;
 
@@ -654,9 +683,16 @@ export async function dispatchFirebasePasswordResetEmail(
       if (retryRes.ok) return true;
     }
 
+    const errorBody: any = await res.json().catch(() => null);
+    console.error('Firebase Auth sendOobCode rejected:', {
+      status: res.status,
+      code: errorBody?.error?.message || 'UNKNOWN_ERROR',
+    });
     return false;
-  } catch (err) {
-    console.error('Firebase Auth sendOobCode request failed:', err);
+  } catch (err: any) {
+    console.error('Firebase Auth sendOobCode network error:', {
+      message: err?.message,
+    });
     return false;
   }
 }
@@ -670,6 +706,10 @@ export async function ensureUserExistsInFirebaseAuth(
   email: string,
   displayName?: string
 ): Promise<boolean> {
+  if (customFirebaseProvisioningForTests) {
+    return customFirebaseProvisioningForTests(email, displayName);
+  }
+
   const normalizedEmail = email.toLowerCase().trim();
 
   // 1. Try Firebase Admin SDK if available
@@ -688,13 +728,20 @@ export async function ensureUserExistsInFirebaseAuth(
         return true;
       } catch (createErr: any) {
         if (createErr?.code === 'auth/email-already-exists') return true;
+        console.error('Firebase Admin createUser error:', {
+          code: createErr?.code,
+          message: createErr?.message,
+        });
       }
     }
   }
 
   // 2. Identity Toolkit API fallback via apiKey if Admin SDK lacks IAM permissions
   const apiKey = firebaseConfig?.apiKey?.trim();
-  if (!apiKey) return false;
+  if (!apiKey) {
+    console.error('Firebase Auth provisioning failed: apiKey is missing from config');
+    return false;
+  }
 
   try {
     const tempPassword = `Tmp_${crypto.randomBytes(16).toString('hex')}!Aa1`;
@@ -715,9 +762,15 @@ export async function ensureUserExistsInFirebaseAuth(
     if (body?.error?.message === 'EMAIL_EXISTS') {
       return true;
     }
+    console.error('Identity Toolkit accounts:signUp rejected:', {
+      status: res.status,
+      code: body?.error?.message || 'UNKNOWN_ERROR',
+    });
     return false;
-  } catch (err) {
-    console.error('Failed to provision user in Firebase Auth:', err);
+  } catch (err: any) {
+    console.error('Failed to provision user in Firebase Auth:', {
+      message: err?.message,
+    });
     return false;
   }
 }
@@ -942,7 +995,12 @@ export async function requestPasswordRecoveryToken(
   accepted: true;
   message: string;
   expiresInMinutes: number;
-  deliveryChannel?: 'firebase' | 'local_token' | 'noop';
+  deliveryChannel?:
+    | 'firebase'
+    | 'firebase_provisioning_failure'
+    | 'firebase_send_failure'
+    | 'local_token'
+    | 'noop';
   _testRecoveryToken?: string;
 }> {
   try {
@@ -1043,33 +1101,55 @@ export async function requestPasswordRecoveryToken(
       );
 
     // If this account was registered locally, ensure it exists in Firebase Auth so Firebase can deliver the reset email
-    await ensureUserExistsInFirebaseAuth(user.email, user.displayName);
+    const provisioned = await ensureUserExistsInFirebaseAuth(user.email, user.displayName);
+    if (!provisioned) {
+      console.error('Password recovery: Firebase user provisioning failed for user', {
+        uid: user.uid,
+        authProvider: user.authProvider,
+      });
+    }
 
     const shouldTriggerFirebase =
       options?.triggerFirebaseEmail ?? process.env.NODE_ENV !== 'test';
 
+    let emailDispatched = true;
     if (shouldTriggerFirebase) {
-      const resetActionUrl = `${trustedOrigin}/?mode=resetPassword`;
-      const sent = await dispatchFirebasePasswordResetEmail(user.email, resetActionUrl);
-      if (!sent) {
-        throw new ClientSafeError(
-          'Password recovery service is temporarily unavailable. Please try again shortly.',
-          503
-        );
+      if (!provisioned) {
+        emailDispatched = false;
+      } else {
+        const resetActionUrl = `${trustedOrigin}/?mode=resetPassword`;
+        const sent = await dispatchFirebasePasswordResetEmail(user.email, resetActionUrl);
+        if (!sent) {
+          console.error(
+            'Password recovery: Firebase password reset email dispatch failed for user',
+            {
+              uid: user.uid,
+              authProvider: user.authProvider,
+            }
+          );
+          emailDispatched = false;
+        }
       }
     }
+
+    const deliveryChannel: 'firebase' | 'firebase_provisioning_failure' | 'firebase_send_failure' =
+      !provisioned
+        ? 'firebase_provisioning_failure'
+        : !emailDispatched
+        ? 'firebase_send_failure'
+        : 'firebase';
 
     const response: {
       accepted: true;
       message: string;
       expiresInMinutes: number;
-      deliveryChannel: 'firebase';
+      deliveryChannel: 'firebase' | 'firebase_provisioning_failure' | 'firebase_send_failure';
       _testRecoveryToken?: string;
     } = {
       accepted: true,
       message: GENERIC_PASSWORD_RECOVERY_MESSAGE,
       expiresInMinutes: 15,
-      deliveryChannel: 'firebase',
+      deliveryChannel,
     };
 
     if (options?.returnTokenForTesting && process.env.NODE_ENV === 'test') {
@@ -1178,7 +1258,9 @@ export async function confirmPasswordRecoveryToken(
         }
 
         const nextProvider =
-          targetUser.authProvider === 'firebase' ? 'both' : targetUser.authProvider;
+          (targetUser.authProvider === 'firebase' || targetUser.authProvider === 'local')
+            ? 'both'
+            : targetUser.authProvider;
 
         const [updated] = await tx
           .update(users)
@@ -1264,7 +1346,9 @@ export async function confirmPasswordRecoveryToken(
         );
 
       const nextProvider =
-        targetUser.authProvider === 'firebase' ? 'both' : targetUser.authProvider;
+        (targetUser.authProvider === 'firebase' || targetUser.authProvider === 'local')
+          ? 'both'
+          : targetUser.authProvider;
 
       const [updated] = await tx
         .update(users)

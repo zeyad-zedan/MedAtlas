@@ -32,6 +32,8 @@ import {
   getOrCreateUser,
   validateTrustedRecoveryOrigin,
   setFirebaseOobHandlerForTests,
+  setFirebaseProvisioningHandlerForTests,
+  setFirebaseEmailDispatchHandlerForTests,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   authenticateEmailUser,
@@ -610,6 +612,218 @@ describe('Security & Reliability Audit Regression Suite', () => {
     // Incorrect password fails
     const badAuth = await authenticateEmailUser(testEmail, 'WrongPassword123!');
     assert.equal(badAuth, null);
+  });
+
+  it('P2.5 Firebase provisioning failure and email delivery failure are handled safely without exposing account existence', async () => {
+    const testEmail = `error.handling.${TEST_RUN_ID}@medatlas.test`;
+    const user = await registerEmailPasswordUser(
+      testEmail,
+      'ErrorHandlingPass123!',
+      'Error Handling Student'
+    );
+    createdUserUids.push(user.uid);
+
+    // 1. Firebase user provisioning failure:
+    // When ensureUserExistsInFirebaseAuth fails (returns false), requestPasswordRecoveryToken
+    // detects the failure, logs it safely, returns accepted: true with generic message, and does NOT leak existence.
+    setFirebaseProvisioningHandlerForTests(async () => false);
+    try {
+      const provFailRes = await requestPasswordRecoveryToken(testEmail, {
+        origin: 'https://medatlas.ai.studio',
+        triggerFirebaseEmail: true,
+      });
+      assert.equal(provFailRes.accepted, true);
+      assert.ok(provFailRes.message.length > 10);
+      assert.equal(provFailRes.deliveryChannel, 'firebase_provisioning_failure');
+
+      // Compare with non-existent user response: identical client-visible contract
+      const nonExistentRes = await requestPasswordRecoveryToken(
+        `nonexistent.${TEST_RUN_ID}@medatlas.test`,
+        { origin: 'https://medatlas.ai.studio' }
+      );
+      assert.equal(nonExistentRes.accepted, true);
+      assert.equal(nonExistentRes.message, provFailRes.message);
+      assert.equal(nonExistentRes.expiresInMinutes, provFailRes.expiresInMinutes);
+    } finally {
+      setFirebaseProvisioningHandlerForTests(null);
+    }
+
+    // 2. Firebase email-delivery failure:
+    // When dispatchFirebasePasswordResetEmail fails (returns false), requestPasswordRecoveryToken
+    // detects the failure, logs it safely, returns accepted: true with generic message, and does NOT leak existence.
+    setFirebaseEmailDispatchHandlerForTests(async () => false);
+    try {
+      const sendFailRes = await requestPasswordRecoveryToken(testEmail, {
+        origin: 'https://medatlas.ai.studio',
+        triggerFirebaseEmail: true,
+      });
+      assert.equal(sendFailRes.accepted, true);
+      assert.ok(sendFailRes.message.length > 10);
+      assert.equal(sendFailRes.deliveryChannel, 'firebase_send_failure');
+    } finally {
+      setFirebaseEmailDispatchHandlerForTests(null);
+    }
+  });
+
+  it('P2.6 Firebase accounts:resetPassword flow validates OOB codes before consuming, rejecting expired, invalid, and used codes without inconsistent state', async () => {
+    const testEmail = `oob.validation.${TEST_RUN_ID}@medatlas.test`;
+    const initialPassword = 'InitialValidPassword123!';
+    const user = await registerEmailPasswordUser(
+      testEmail,
+      initialPassword,
+      'OOB Validation Student'
+    );
+    createdUserUids.push(user.uid);
+
+    const oldSessionToken = createServerSessionToken({
+      uid: user.uid,
+      email: user.email,
+      name: user.displayName,
+      tokenVersion: user.tokenVersion,
+    });
+
+    // 1. Expired OOB code: Phase 1 verifyOnly rejects it; consume must NEVER be called; DB state unchanged
+    let consumeCalled = false;
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async () => {
+        throw new ClientSafeError(
+          'Invalid, expired, or already used password recovery token.',
+          400
+        );
+      },
+      consume: async () => {
+        consumeCalled = true;
+        throw new Error('Consume must not be called when verifyOnly rejects');
+      },
+    });
+
+    try {
+      await assert.rejects(
+        async () => {
+          await confirmPasswordRecoveryToken(
+            'expired_oob_code_test_123456789012345',
+            'NewAttemptedPassword123!'
+          );
+        },
+        (err: any) =>
+          err instanceof ClientSafeError &&
+          err.statusCode === 400 &&
+          /Invalid, expired, or already used/i.test(err.message)
+      );
+      assert.equal(consumeCalled, false);
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    // Verify DB state was NOT modified: old password and session token still valid
+    const userAfterExpired = await findUserByEmail(testEmail);
+    assert.equal(userAfterExpired?.tokenVersion, 1);
+    assert.equal(verifyPassword(initialPassword, userAfterExpired!.passwordHash!), true);
+
+    // 2. Invalid OOB code: Phase 1 verifyOnly rejects it; consume must NEVER be called
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async () => {
+        throw new ClientSafeError(
+          'Invalid, expired, or already used password recovery token.',
+          400
+        );
+      },
+      consume: async () => {
+        consumeCalled = true;
+        throw new Error('Consume must not be called when code is invalid');
+      },
+    });
+
+    try {
+      await assert.rejects(
+        async () => {
+          await confirmPasswordRecoveryToken(
+            'malformed_or_tampered_code_1234567890',
+            'NewAttemptedPassword123!'
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    // 3. Valid OOB code succeeds once, promotes local user to linked 'both', and invalidates prior sessions
+    let codeConsumed = false;
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async (_code) => {
+        if (codeConsumed) {
+          throw new ClientSafeError(
+            'Invalid, expired, or already used password recovery token.',
+            400
+          );
+        }
+        return { email: testEmail };
+      },
+      consume: async (_code, _newPass) => {
+        if (codeConsumed) {
+          throw new ClientSafeError(
+            'Invalid, expired, or already used password recovery token.',
+            400
+          );
+        }
+        codeConsumed = true;
+        return { email: testEmail };
+      },
+    });
+
+    const newPassword = 'NewlyUpdatedSecurePassword456!';
+    try {
+      const resetResult = await confirmPasswordRecoveryToken(
+        'valid_single_use_oob_code_1234567890',
+        newPassword
+      );
+      assert.equal(codeConsumed, true);
+      assert.equal(resetResult.tokenVersion, 2);
+      assert.equal(resetResult.authProvider, 'both');
+
+      // 4. Replay attack: Reusing the same OOB code must be rejected (single-use enforcement)
+      await assert.rejects(
+        async () => {
+          await confirmPasswordRecoveryToken(
+            'valid_single_use_oob_code_1234567890',
+            'YetAnotherPassword789!'
+          );
+        },
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    // 5. Verify credential consistency & session revocation:
+    // Old password must NO LONGER authenticate; new password must authenticate
+    const finalUser = await findUserByEmail(testEmail);
+    assert.equal(verifyPassword(initialPassword, finalUser!.passwordHash!), false);
+    assert.equal(verifyPassword(newPassword, finalUser!.passwordHash!), true);
+    assert.equal(finalUser?.authProvider, 'both');
+    assert.equal(finalUser?.tokenVersion, 2);
+
+    // Old session token (tokenVersion=1) must be rejected with 401
+    let sessionStatus = 200;
+    const mockReq = {
+      headers: { authorization: `Bearer ${oldSessionToken}` },
+    } as unknown as AuthRequest;
+    const mockRes = {
+      status(code: number) {
+        sessionStatus = code;
+        return this;
+      },
+      json(_b: any) {
+        return this;
+      },
+    } as any;
+    let nextCalled = false;
+    await requireAuth(mockReq, mockRes, () => {
+      nextCalled = true;
+    });
+    assert.equal(nextCalled, false);
+    assert.equal(sessionStatus, 401);
   });
 
   // ==========================================================================

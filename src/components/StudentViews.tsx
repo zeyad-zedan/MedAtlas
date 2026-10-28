@@ -1479,6 +1479,7 @@ export const ProfileSettingsView: React.FC<{
                 id="profile-current-password"
                 type="password"
                 required
+                maxLength={128}
                 value={currentPassword}
                 onChange={(e) => setCurrentPassword(e.target.value)}
                 placeholder="••••••••"
@@ -1492,13 +1493,14 @@ export const ProfileSettingsView: React.FC<{
               htmlFor="profile-new-password"
               className="block font-semibold text-slate-700 mb-1"
             >
-              New Password (min 8 characters)
+              New Password (8–128 characters)
             </label>
             <input
               id="profile-new-password"
               type="password"
               required
               minLength={8}
+              maxLength={128}
               value={newPassword}
               onChange={(e) => setNewPassword(e.target.value)}
               placeholder="••••••••"

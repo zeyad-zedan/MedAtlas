@@ -10,14 +10,22 @@ import {
   createServerSessionToken,
   verifyServerSessionToken,
   verifyPassword,
+  verifyPasswordAsync,
+  hashPasswordAsync,
+  validatePasswordBounds,
+  MIN_PASSWORD_LENGTH,
+  MAX_PASSWORD_LENGTH,
+  MAX_PASSWORD_BYTES,
   hashRecoveryToken,
   requireAuth,
   recordUserSessionRevocation,
   setFirebaseTokenVerifierForTests,
+  setFirebaseLookupRestHandlerForTests,
   type AuthRequest,
 } from '../middleware/auth.ts';
 import {
   createBoundedRateLimiter,
+  createPostgresRateLimitStore,
   normalizeClientIp,
   resolveTrustProxyConfig,
 } from '../middleware/rate-limit.ts';
@@ -31,15 +39,22 @@ import {
   getAuthenticatedUserByUid,
   getOrCreateUser,
   validateTrustedRecoveryOrigin,
+  extractRecoveryCodeFromInput,
   setFirebaseOobHandlerForTests,
+  setFirebasePasswordUpdateHandlerForTests,
+  setFirebasePasswordVerifyHandlerForTests,
   setFirebaseProvisioningHandlerForTests,
   setFirebaseEmailDispatchHandlerForTests,
+  setFirebaseAccountDeletionHandlerForTests,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   authenticateEmailUser,
+  changeAuthenticatedUserPassword,
   linkPasswordToAuthenticatedAccount,
+  updateUserProfile,
   revokeUserSessions,
   deleteUserAccount,
+  reconcilePendingDeletedAccounts,
   updateUserRoleAdmin,
   toggleBookmarkForStudent,
   saveSessionQuestionAnswer,
@@ -51,6 +66,7 @@ import {
   users,
   passwordResetTokens,
   deletedAccounts,
+  rateLimitBuckets,
   subjects,
   lectures,
   questions,
@@ -68,7 +84,13 @@ const createdSessionIds: number[] = [];
 
 after(async () => {
   setFirebaseTokenVerifierForTests(null);
+  setFirebaseLookupRestHandlerForTests(null);
   setFirebaseOobHandlerForTests(null);
+  setFirebasePasswordUpdateHandlerForTests(null);
+  setFirebasePasswordVerifyHandlerForTests(null);
+  setFirebaseProvisioningHandlerForTests(null);
+  setFirebaseEmailDispatchHandlerForTests(null);
+  setFirebaseAccountDeletionHandlerForTests(null);
   try {
     if (createdSessionIds.length > 0) {
       await db
@@ -309,14 +331,10 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
     createdUserUids.push(user.uid);
 
-    // 1. Verify trusted recovery origins (medatlas.ai.studio, *.ai.studio, *.run.app) are trusted
+    // 1. Verify exact allowlisted recovery origins are trusted while arbitrary *.ai.studio / *.run.app are rejected
     assert.equal(
       validateTrustedRecoveryOrigin('https://medatlas.ai.studio'),
       'https://medatlas.ai.studio'
-    );
-    assert.equal(
-      validateTrustedRecoveryOrigin('https://preview-test.ai.studio'),
-      'https://preview-test.ai.studio'
     );
     assert.equal(
       validateTrustedRecoveryOrigin(
@@ -325,7 +343,16 @@ describe('Security & Reliability Audit Regression Suite', () => {
       'https://ais-dev-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
     );
 
-    // Untrusted recovery origin must be rejected with 400
+    // Arbitrary *.ai.studio or external origins must be rejected unless explicitly in ALLOWED_RECOVERY_ORIGINS
+    await assert.rejects(
+      async () => {
+        validateTrustedRecoveryOrigin('https://preview-test.ai.studio');
+      },
+      (err: any) =>
+        err instanceof ClientSafeError &&
+        err.statusCode === 400 &&
+        /untrusted/i.test(err.message)
+    );
     await assert.rejects(
       async () => {
         validateTrustedRecoveryOrigin('https://evil-phishing.example.com');
@@ -556,21 +583,27 @@ describe('Security & Reliability Audit Regression Suite', () => {
     );
   });
 
-  it('P2.4 Untrusted recovery origins are rejected, while medatlas.ai.studio, *.ai.studio, and *.run.app succeed seamlessly', async () => {
-    // Trusted platform origins must succeed
+  it('P2.4 Untrusted recovery origins (including arbitrary *.ai.studio / *.run.app) are rejected, while exact allowlisted origins succeed', async () => {
+    // Exact allowlisted origins must succeed
     assert.equal(
       validateTrustedRecoveryOrigin('https://medatlas.ai.studio'),
       'https://medatlas.ai.studio'
-    );
-    assert.equal(
-      validateTrustedRecoveryOrigin('https://preview-test.ai.studio'),
-      'https://preview-test.ai.studio'
     );
     assert.equal(
       validateTrustedRecoveryOrigin(
         'https://ais-pre-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
       ),
       'https://ais-pre-5mhsafvm6orewiuxge6ast-323922691346.europe-west1.run.app'
+    );
+
+    // Arbitrary subdomain of .ai.studio or .run.app must be rejected unless explicitly configured
+    await assert.rejects(
+      async () => validateTrustedRecoveryOrigin('https://preview-test.ai.studio'),
+      (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+    );
+    await assert.rejects(
+      async () => validateTrustedRecoveryOrigin('https://other-tenant-xyz.run.app'),
+      (err: any) => err instanceof ClientSafeError && err.statusCode === 400
     );
 
     // Path or query injection in recovery origin must be rejected with 400
@@ -1363,7 +1396,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
   // ==========================================================================
   // PRIORITY 6: HARDEN RATE-LIMIT IP HANDLING AGAINST SPOOFED X-FORWARDED-FOR
   // ==========================================================================
-  it('P6. Enforces request rate limits, ignores spoofed X-Forwarded-For headers, prunes expired entries, and caps memory at maxKeys', () => {
+  it('P6. Enforces request rate limits, ignores spoofed X-Forwarded-For headers, prunes expired entries, and caps memory at maxKeys', async () => {
     assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: '0' } as any), false);
     assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: 'false' } as any), false);
     assert.equal(resolveTrustProxyConfig({ TRUST_PROXY_HOPS: '2' } as any), 2);
@@ -1392,11 +1425,12 @@ describe('Security & Reliability Audit Regression Suite', () => {
       maxKeys: 25,
     });
 
-    const makeMockPair = (socketIp: string, spoofedXff?: string) => {
+    const makeMockPair = (socketIp: string, spoofedXff?: string, body?: any) => {
       let statusCode = 200;
       const headers: Record<string, string> = {};
       const req = {
         ip: socketIp,
+        body: body || {},
         headers: spoofedXff ? { 'x-forwarded-for': spoofedXff } : {},
         baseUrl: '/api/auth',
         path: '/login',
@@ -1426,7 +1460,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
     for (let i = 1; i <= 3; i++) {
       const { req, res, getStatus } = makeMockPair('10.0.0.1', `203.0.113.${i}`);
       let nextCalled = false;
-      limiter(req, res, () => {
+      await limiter(req, res, () => {
         nextCalled = true;
       });
       assert.equal(nextCalled, true);
@@ -1436,7 +1470,7 @@ describe('Security & Reliability Audit Regression Suite', () => {
     // 4th request from 10.0.0.1 with a brand-new spoofed X-Forwarded-For MUST still be blocked (429)
     const fourth = makeMockPair('10.0.0.1', '198.51.100.250');
     let fourthNext = false;
-    limiter(fourth.req, fourth.res, () => {
+    await limiter(fourth.req, fourth.res, () => {
       fourthNext = true;
     });
     assert.equal(fourthNext, false);
@@ -1445,14 +1479,14 @@ describe('Security & Reliability Audit Regression Suite', () => {
 
     for (let i = 0; i < 100; i++) {
       const { req, res } = makeMockPair(`192.168.1.${i}`);
-      limiter(req, res, () => {});
+      await limiter(req, res, () => {});
       assert.ok(
         limiter.getStoreSize() <= 25,
         `Rate limiter exceeded maxKeys: ${limiter.getStoreSize()}`
       );
     }
 
-    const removed = limiter.pruneExpired(Date.now() + 10_000);
+    const removed = await limiter.pruneExpired(Date.now() + 10_000);
     assert.equal(removed, 25);
     assert.equal(limiter.getStoreSize(), 0);
   });
@@ -1506,4 +1540,902 @@ describe('Security & Reliability Audit Regression Suite', () => {
     assert.ok(clean2.includes('style="fill: #0284C7"'));
     assert.ok(clean2.includes('<text x="20" y="35" fill="#ffffff">AV Node</text>'));
   });
+
+  // ==========================================================================
+  // FINDING 1: PASSWORD RECOVERY CONSISTENCY BETWEEN FIREBASE AND POSTGRESQL
+  // ==========================================================================
+  it('R1. Supports custom action-handler URL extraction, handles provider 503 and DB commit failures safely, and synchronizes out-of-band Firebase hosted resets while invalidating old local passwords and sessions', async () => {
+    const email = `r1.recovery.${TEST_RUN_ID}@medatlas.test`;
+    const oldPass = 'R1InitialPassword123!';
+    const newPassViaUrl = 'R1UrlExtractedPassword456!';
+    const newPassHosted = 'R1HostedFirebaseResetPass789!';
+
+    const user = await registerEmailPasswordUser(email, oldPass, 'R1 Recovery Student');
+    createdUserUids.push(user.uid);
+
+    // 1. Verify extractRecoveryCodeFromInput handles both raw oobCodes and full pasted reset URLs
+    const rawOob = 'oob_action_code_valid_9876543210_abcdef';
+    const fullResetUrl = `https://medatlas.ai.studio/?mode=resetPassword&oobCode=${encodeURIComponent(rawOob)}&apiKey=AIzaTestKey`;
+    assert.equal(extractRecoveryCodeFromInput(rawOob), rawOob);
+    assert.equal(extractRecoveryCodeFromInput(fullResetUrl), rawOob);
+
+    // 2. Provider 503 outage during OOB verification fails safely with 503 and leaves credentials intact
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async () => {
+        throw new ClientSafeError(
+          'Password recovery service is temporarily unavailable. Please try again shortly.',
+          503
+        );
+      },
+      consume: async () => {
+        throw new Error('Consume must not run on 503');
+      },
+    });
+    try {
+      await assert.rejects(
+        async () => confirmPasswordRecoveryToken(fullResetUrl, newPassViaUrl),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 503
+      );
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    // 3. Database commit failure AFTER OOB code consumption rolls back transaction, throws error (never claims success),
+    // and leaves `pendingRecoveryAt` set so the old local password cannot be used while allowing Firebase sync on login.
+    let oobConsumedInFailedTx = false;
+    setFirebaseOobHandlerForTests({
+      verifyOnly: async () => ({ email }),
+      consume: async () => {
+        oobConsumedInFailedTx = true;
+        return { email };
+      },
+    });
+    try {
+      await assert.rejects(
+        async () =>
+          confirmPasswordRecoveryToken(fullResetUrl, newPassViaUrl, {
+            simulateDbFailureAfterConsumeForTests: async () => {
+              throw new Error('Simulated DB commit failure after OOB consume');
+            },
+          }),
+        /Failed to reset password/i
+      );
+      assert.equal(oobConsumedInFailedTx, true);
+    } finally {
+      setFirebaseOobHandlerForTests(null);
+    }
+
+    const userAfterFailedTx = await findUserByEmail(email);
+    assert.ok(
+      userAfterFailedTx?.pendingRecoveryAt,
+      'pendingRecoveryAt must remain set when DB commit fails after OOB consumption'
+    );
+
+    // 4. Out-of-band Firebase hosted reset (or recovery after partial failure during active pendingRecoveryAt window):
+    // Initiate a fresh recovery request so `pendingRecoveryAt` is active
+    setFirebaseProvisioningHandlerForTests(async () => ({
+      provisioned: true,
+      firebaseUid: `fb_shadow_${TEST_RUN_ID}`,
+    }));
+    setFirebaseEmailDispatchHandlerForTests(async (_em, continueUrl) => {
+      assert.equal(continueUrl, 'https://medatlas.ai.studio/?mode=resetPassword');
+      return true;
+    });
+    try {
+      const reqRes = await requestPasswordRecoveryToken(email, {
+        origin: 'https://medatlas.ai.studio',
+        triggerFirebaseEmail: true,
+      });
+      assert.equal(reqRes.deliveryChannel, 'firebase');
+    } finally {
+      setFirebaseProvisioningHandlerForTests(null);
+      setFirebaseEmailDispatchHandlerForTests(null);
+    }
+
+    const oldTokenBeforeHostedReset = createServerSessionToken({
+      uid: user.uid,
+      email: user.email,
+      name: user.displayName,
+      tokenVersion: user.tokenVersion,
+    });
+
+    // Simulate user completing the password reset on Firebase's hosted page (so Firebase now only accepts `newPassHosted`)
+    setFirebasePasswordVerifyHandlerForTests(async (_em, candidatePass) => ({
+      valid: candidatePass === newPassHosted,
+      firebaseUid: `fb_shadow_${TEST_RUN_ID}`,
+      definiteRejection: candidatePass !== newPassHosted,
+    }));
+
+    try {
+      // Old local password MUST BE REJECTED because `pendingRecoveryAt` is active and Firebase definitively rejects `oldPass`
+      const oldPassAttempt = await authenticateEmailUser(email, oldPass);
+      assert.equal(
+        oldPassAttempt,
+        null,
+        'Old local password must be rejected when user reset password via Firebase hosted flow'
+      );
+
+      // New password set on Firebase hosted page succeeds, synchronizes PostgreSQL hash, clears pendingRecoveryAt, and revokes old sessions!
+      const syncedUser = await authenticateEmailUser(email, newPassHosted);
+      assert.ok(syncedUser, 'New Firebase password must authenticate and synchronize local DB');
+      assert.ok(syncedUser.tokenVersion > user.tokenVersion);
+      assert.equal(syncedUser.pendingRecoveryAt, null);
+      assert.equal(syncedUser.firebaseUid, `fb_shadow_${TEST_RUN_ID}`);
+      assert.equal(await verifyPasswordAsync(newPassHosted, syncedUser.passwordHash!), true);
+      assert.equal(await verifyPasswordAsync(oldPass, syncedUser.passwordHash!), false);
+    } finally {
+      setFirebasePasswordVerifyHandlerForTests(null);
+    }
+
+    // Old session token issued before hosted reset synchronization must now be rejected (401)
+    let oldSessionStatus = 200;
+    const req = {
+      headers: { authorization: `Bearer ${oldTokenBeforeHostedReset}` },
+    } as unknown as AuthRequest;
+    const res = {
+      status(c: number) {
+        oldSessionStatus = c;
+        return this;
+      },
+      json() {
+        return this;
+      },
+    } as any;
+    let nextCalled = false;
+    await requireAuth(req, res, () => {
+      nextCalled = true;
+    });
+    assert.equal(nextCalled, false);
+    assert.equal(oldSessionStatus, 401);
+  });
+
+  // ==========================================================================
+  // FINDING 2: FIX PASSWORD-CHANGE CREDENTIAL DIVERGENCE
+  // ==========================================================================
+  it('R2. Synchronizes authenticated password changes to Firebase, fails closed when provider update fails, and never lets a stale Firebase password overwrite a newer local password', async () => {
+    const email = `r2.divergence.${TEST_RUN_ID}@medatlas.test`;
+    const initialPass = 'R2InitialPassword123!';
+    const changedPass = 'R2ChangedPassword456!';
+
+    const user = await registerEmailPasswordUser(email, initialPass, 'R2 Student');
+    createdUserUids.push(user.uid);
+
+    // Attach a firebaseUid so the account is a linked hybrid account
+    await db
+      .update(users)
+      .set({ firebaseUid: `fb_r2_${TEST_RUN_ID}`, authProvider: 'both' })
+      .where(eq(users.uid, user.uid));
+
+    // 1. If Firebase provider password sync fails during changeAuthenticatedUserPassword, it must fail closed (503)
+    // and NOT modify the PostgreSQL passwordHash.
+    setFirebasePasswordUpdateHandlerForTests(async () => false);
+    try {
+      await assert.rejects(
+        async () => changeAuthenticatedUserPassword(user.uid, initialPass, changedPass),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 503
+      );
+    } finally {
+      setFirebasePasswordUpdateHandlerForTests(null);
+    }
+
+    // Verify initial password still works after failed provider sync
+    const afterFailedChange = await authenticateEmailUser(email, initialPass);
+    assert.ok(afterFailedChange);
+
+    // 2. When Firebase provider sync succeeds, changeAuthenticatedUserPassword updates PostgreSQL,
+    // updates passwordUpdatedAt, clears pendingRecoveryAt, and increments tokenVersion.
+    let syncedToFirebaseNewPass = '';
+    setFirebasePasswordUpdateHandlerForTests(async (params) => {
+      syncedToFirebaseNewPass = params.newPassword;
+      return true;
+    });
+    try {
+      const updated = await changeAuthenticatedUserPassword(
+        user.uid,
+        initialPass,
+        changedPass
+      );
+      assert.equal(syncedToFirebaseNewPass, changedPass);
+      assert.ok(updated.passwordUpdatedAt);
+      assert.equal(updated.pendingRecoveryAt, null);
+    } finally {
+      setFirebasePasswordUpdateHandlerForTests(null);
+    }
+
+    // 3. Even if Firebase Auth somehow still accepted the OLD password (`initialPass`),
+    // `authenticateEmailUser` MUST reject `initialPass` and NEVER overwrite the newer local password hash!
+    setFirebasePasswordVerifyHandlerForTests(async (_em, candidatePass) => ({
+      valid: candidatePass === initialPass, // Simulate stale provider accepting old password
+      firebaseUid: `fb_r2_${TEST_RUN_ID}`,
+      definiteRejection: false,
+    }));
+    try {
+      const staleAttempt = await authenticateEmailUser(email, initialPass);
+      assert.equal(
+        staleAttempt,
+        null,
+        'Stale provider password must NEVER authenticate or overwrite a newer local password'
+      );
+
+      // And the new password (`changedPass`) continues to authenticate via authoritative PostgreSQL hash
+      const validNewAttempt = await authenticateEmailUser(email, changedPass);
+      assert.ok(validNewAttempt);
+      assert.equal(validNewAttempt.uid, user.uid);
+    } finally {
+      setFirebasePasswordVerifyHandlerForTests(null);
+    }
+  });
+
+  // ==========================================================================
+  // FINDING 3: FAIL SAFELY WHEN CHECKING FIREBASE TOKEN REVOCATION
+  // ==========================================================================
+  it('R3. Fails closed on revoked, disabled, expired, generic Firebase errors, and network timeouts while allowing narrow config fallback only when live/DB state is verified', async () => {
+    const fbUid = `fb_r3_revocation_${TEST_RUN_ID}`;
+    const fbEmail = `r3.revocation.${TEST_RUN_ID}@medatlas.test`;
+    createdUserUids.push(fbUid);
+
+    await getOrCreateUser(fbUid, fbEmail, 'R3 Revocation User', {
+      authType: 'firebase',
+      emailVerified: true,
+      allowCreate: true,
+    });
+
+    const callRequireAuth = async () => {
+      let status = 200;
+      let nextCalled = false;
+      const req = {
+        headers: { authorization: 'Bearer mock.r3.firebase.token' },
+      } as unknown as AuthRequest;
+      const res = {
+        status(code: number) {
+          status = code;
+          return this;
+        },
+        json() {
+          return this;
+        },
+      } as any;
+      await requireAuth(req, res, () => {
+        nextCalled = true;
+      });
+      return { status, nextCalled };
+    };
+
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    try {
+      // 1. Explicitly revoked token -> 401
+      setFirebaseTokenVerifierForTests(async () => {
+        const err: any = new Error('Revoked');
+        err.code = 'auth/id-token-revoked';
+        throw err;
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 401, nextCalled: false });
+
+      // 2. Disabled user -> 403
+      setFirebaseTokenVerifierForTests(async () => {
+        const err: any = new Error('Disabled');
+        err.code = 'auth/user-disabled';
+        throw err;
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 403, nextCalled: false });
+
+      // 3. Expired token -> 401
+      setFirebaseTokenVerifierForTests(async () => {
+        const err: any = new Error('Expired');
+        err.code = 'auth/id-token-expired';
+        throw err;
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 401, nextCalled: false });
+
+      // 4. Generic Firebase internal error -> fails closed with 503 (never falls back to checkRevoked=false)
+      setFirebaseTokenVerifierForTests(async (_token, checkRevoked) => {
+        if (checkRevoked) {
+          const err: any = new Error('Internal Firebase failure');
+          err.code = 'auth/internal-error';
+          throw err;
+        }
+        throw new Error('Must NOT call verifyIdToken(token, false) on generic internal error');
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 503, nextCalled: false });
+
+      // 5. Network timeout -> fails closed with 503
+      setFirebaseTokenVerifierForTests(async (_token, checkRevoked) => {
+        if (checkRevoked) {
+          const err: any = new Error('connect ETIMEDOUT');
+          err.code = 'ETIMEDOUT';
+          throw err;
+        }
+        throw new Error('Must NOT call verifyIdToken(token, false) on network timeout');
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 503, nextCalled: false });
+
+      // 6. Unexpected IAM permission error -> fails closed with 503
+      setFirebaseTokenVerifierForTests(async (_token, checkRevoked) => {
+        if (checkRevoked) {
+          const err: any = new Error('Insufficient permission');
+          err.code = 'auth/insufficient-permission';
+          throw err;
+        }
+        throw new Error('Must NOT call verifyIdToken(token, false) on permission error');
+      });
+      assert.deepEqual(await callRequireAuth(), { status: 503, nextCalled: false });
+
+      // 7. Narrow ADC configuration absence (`app/invalid-credential`) with live lookup verifying active user -> 200
+      setFirebaseTokenVerifierForTests(async (_token, checkRevoked) => {
+        if (checkRevoked) {
+          const err: any = new Error('Could not load the default credentials');
+          err.code = 'app/invalid-credential';
+          throw err;
+        }
+        return {
+          uid: fbUid,
+          email: fbEmail,
+          name: 'R3 Revocation User',
+          email_verified: true,
+          iat: nowSec,
+          auth_time: nowSec,
+        };
+      });
+      setFirebaseLookupRestHandlerForTests(async () => ({
+        status: 'ok',
+        disabled: false,
+        validSinceSec: nowSec - 60,
+      }));
+      assert.deepEqual(await callRequireAuth(), { status: 200, nextCalled: true });
+
+      // If live lookup reports disabled user during narrow config fallback -> 403
+      setFirebaseLookupRestHandlerForTests(async () => ({
+        status: 'ok',
+        disabled: true,
+        validSinceSec: nowSec - 60,
+      }));
+      assert.deepEqual(await callRequireAuth(), { status: 403, nextCalled: false });
+
+      // If live lookup reports validSince newer than token iat -> 401
+      setFirebaseLookupRestHandlerForTests(async () => ({
+        status: 'ok',
+        disabled: false,
+        validSinceSec: nowSec + 120,
+      }));
+      assert.deepEqual(await callRequireAuth(), { status: 401, nextCalled: false });
+    } finally {
+      setFirebaseTokenVerifierForTests(null);
+      setFirebaseLookupRestHandlerForTests(null);
+    }
+  });
+
+  // ==========================================================================
+  // FINDING 4: ACCOUNT DELETION, FIREBASE IDENTITY MAPPING & TOMBSTONE HANDLING
+  // ==========================================================================
+  it('R4. Properly maps and cleans up Firebase shadow/provider identities on deletion, preserves deleted UID/firebaseUid tombstones across re-registration, blocks credential fallback for deleted identities, and isolates new accounts', async () => {
+    const email = `r4.lifecycle.${TEST_RUN_ID}@medatlas.test`;
+    const shadowFbUid = `fb_shadow_r4_${TEST_RUN_ID}`;
+    const initialPass = 'R4LifecyclePass123!';
+
+    // 1. Register a local account and attach a Firebase shadow identity + a bookmark record
+    const originalUser = await registerEmailPasswordUser(
+      email,
+      initialPass,
+      'Original R4 User'
+    );
+    createdUserUids.push(originalUser.uid);
+
+    await db
+      .update(users)
+      .set({ firebaseUid: shadowFbUid, authProvider: 'both' })
+      .where(eq(users.uid, originalUser.uid));
+
+    // Clear any pending_retry tombstones from prior aborted test runs
+    await db
+      .update(deletedAccounts)
+      .set({ remoteCleanupStatus: 'completed' })
+      .where(eq(deletedAccounts.remoteCleanupStatus, 'pending_retry'));
+
+    // Simulate remote cleanup failing first (`pending_retry`), then succeeding via `reconcilePendingDeletedAccounts()`
+    let remoteDeleteAttempts = 0;
+    setFirebaseAccountDeletionHandlerForTests(async (params) => {
+      if (params.firebaseUid === shadowFbUid) {
+        remoteDeleteAttempts++;
+        if (remoteDeleteAttempts === 1) {
+          return { deleted: false, errorCode: 'SIMULATED_TRANSIENT_FIREBASE_ERROR' };
+        }
+        return { deleted: true };
+      }
+      return { deleted: true };
+    });
+
+    try {
+      const delRes = await deleteUserAccount(originalUser.uid);
+      assert.equal(delRes.deleted, true);
+      assert.equal(delRes.remoteCleanupStatus, 'pending_retry');
+
+      const reconcileRes = await reconcilePendingDeletedAccounts();
+      assert.ok(reconcileRes.reconciled >= 1);
+
+      const [tombstoneAfterReconcile] = await db
+        .select()
+        .from(deletedAccounts)
+        .where(eq(deletedAccounts.uid, originalUser.uid));
+      assert.ok(tombstoneAfterReconcile);
+      assert.equal(tombstoneAfterReconcile.firebaseUid, shadowFbUid);
+      assert.equal(tombstoneAfterReconcile.remoteCleanupStatus, 'completed');
+    } finally {
+      setFirebaseAccountDeletionHandlerForTests(null);
+    }
+
+    // 2. Attempting to use old Firebase password after deletion fails
+    setFirebasePasswordVerifyHandlerForTests(async () => ({
+      valid: true,
+      firebaseUid: shadowFbUid,
+      definiteRejection: false,
+    }));
+    try {
+      const loginAfterDelete = await authenticateEmailUser(email, initialPass);
+      assert.equal(loginAfterDelete, null);
+    } finally {
+      setFirebasePasswordVerifyHandlerForTests(null);
+    }
+
+    // 3. Re-registering the same email address is permitted under a BRAND-NEW UID,
+    // and MUST NOT erase the deleted_accounts tombstone for `originalUser.uid` or `shadowFbUid`!
+    const reRegisteredUser = await registerEmailPasswordUser(
+      email,
+      'R4BrandNewPass456!',
+      'Re-Registered R4 User'
+    );
+    createdUserUids.push(reRegisteredUser.uid);
+    assert.notEqual(reRegisteredUser.uid, originalUser.uid);
+    assert.equal(reRegisteredUser.role, 'student');
+    assert.equal(reRegisteredUser.firebaseUid, null);
+
+    // Verify original tombstone STILL EXISTS in `deleted_accounts`
+    const [preservedTombstone] = await db
+      .select()
+      .from(deletedAccounts)
+      .where(eq(deletedAccounts.uid, originalUser.uid));
+    assert.ok(
+      preservedTombstone,
+      'Re-registration must NEVER delete the tombstone protecting the old deleted UID and firebaseUid'
+    );
+
+    // 4. Attempting to authenticate with the old local UID or old Firebase UID (`shadowFbUid`) after re-registration
+    // MUST be rejected with 401 and must NEVER link to or access the new account!
+    const staleLocalToken = createServerSessionToken({
+      uid: originalUser.uid,
+      email,
+      name: 'Original R4 User',
+      tokenVersion: 1,
+    });
+
+    const checkTokenRejected = async (bearer: string) => {
+      let status = 200;
+      let nextCalled = false;
+      const req = {
+        headers: { authorization: `Bearer ${bearer}` },
+      } as unknown as AuthRequest;
+      const res = {
+        status(c: number) {
+          status = c;
+          return this;
+        },
+        json() {
+          return this;
+        },
+      } as any;
+      await requireAuth(req, res, () => {
+        nextCalled = true;
+      });
+      return { status, nextCalled };
+    };
+
+    assert.deepEqual(await checkTokenRejected(staleLocalToken), {
+      status: 401,
+      nextCalled: false,
+    });
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    setFirebaseTokenVerifierForTests(async () => ({
+      uid: shadowFbUid,
+      email,
+      name: 'Stale Shadow Identity',
+      email_verified: true,
+      iat: nowSec,
+      auth_time: nowSec,
+    }));
+    try {
+      assert.deepEqual(await checkTokenRejected('mock.stale.firebase.jwt'), {
+        status: 401,
+        nextCalled: false,
+      });
+
+      // Also verify `getOrCreateUser` rejects the tombstoned `shadowFbUid` with 401
+      await assert.rejects(
+        async () =>
+          getOrCreateUser(shadowFbUid, email, 'Stale Shadow Identity', {
+            authType: 'firebase',
+            emailVerified: true,
+            allowCreate: true,
+          }),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 401
+      );
+    } finally {
+      setFirebaseTokenVerifierForTests(null);
+    }
+
+    // 5. Credential fallback attempt using the old tombstoned `shadowFbUid` during a recovery window on the new account
+    // MUST be rejected and never overwrite the new account's password!
+    await db
+      .update(users)
+      .set({ pendingRecoveryAt: new Date() })
+      .where(eq(users.uid, reRegisteredUser.uid));
+
+    setFirebasePasswordVerifyHandlerForTests(async () => ({
+      valid: true,
+      firebaseUid: shadowFbUid, // Tombstoned Firebase UID from the deleted user!
+      definiteRejection: false,
+    }));
+    try {
+      const hijackedAttempt = await authenticateEmailUser(email, initialPass);
+      assert.equal(
+        hijackedAttempt,
+        null,
+        'Deleted Firebase UID must never overwrite credentials on a re-registered account'
+      );
+    } finally {
+      setFirebasePasswordVerifyHandlerForTests(null);
+    }
+  });
+
+  // ==========================================================================
+  // FINDING 5: RESTRICT PASSWORD-RECOVERY ORIGINS
+  // ==========================================================================
+  it('R5. Enforces strict origin allowlist, rejects arbitrary *.ai.studio and *.run.app origins, blocks HTTP in production, and rejects paths/queries/fragments/credentials', () => {
+    const savedAllowed = process.env.ALLOWED_RECOVERY_ORIGINS;
+    const savedAppUrl = process.env.APP_URL;
+    try {
+      process.env.APP_URL = 'https://medatlas.ai.studio';
+      process.env.ALLOWED_RECOVERY_ORIGINS = 'https://custom-trusted.medatlas.org';
+
+      // Allowed origins
+      assert.equal(
+        validateTrustedRecoveryOrigin('https://medatlas.ai.studio'),
+        'https://medatlas.ai.studio'
+      );
+      assert.equal(
+        validateTrustedRecoveryOrigin('https://custom-trusted.medatlas.org'),
+        'https://custom-trusted.medatlas.org'
+      );
+      assert.equal(
+        validateTrustedRecoveryOrigin('http://localhost:3000', { nodeEnv: 'development' }),
+        'http://localhost:3000'
+      );
+
+      // HTTP localhost rejected in production
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('http://localhost:3000', { nodeEnv: 'production' }),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+
+      // Arbitrary *.ai.studio and *.run.app rejected
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://untrusted-other-applet.ai.studio'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://untrusted-other-service.run.app'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+
+      // Paths, query strings, fragments, and credentials rejected
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://medatlas.ai.studio/evil'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://medatlas.ai.studio?next=evil.com'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://medatlas.ai.studio#frag'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+      assert.throws(
+        () => validateTrustedRecoveryOrigin('https://user:pass@medatlas.ai.studio'),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 400
+      );
+    } finally {
+      if (savedAllowed === undefined) delete process.env.ALLOWED_RECOVERY_ORIGINS;
+      else process.env.ALLOWED_RECOVERY_ORIGINS = savedAllowed;
+      if (savedAppUrl === undefined) delete process.env.APP_URL;
+      else process.env.APP_URL = savedAppUrl;
+    }
+  });
+
+  // ==========================================================================
+  // FINDING 6: SHARED POSTGRESQL RATE LIMITING, INDEPENDENT IP/EMAIL LIMITS & ANTI-CHURN
+  // ==========================================================================
+  it('R6. Shares rate-limit counters across instances via PostgreSQL, enforces independent IP and email limits, protects active multi-hit blocks from single-hit key churn, and handles store failures gracefully', async () => {
+    // 1. Protect active multi-hit counters (`count > 1`) from high-cardinality single-hit (`count === 1`) key churn
+    const antiChurnLimiter = createBoundedRateLimiter({
+      scope: `r6-churn-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 3,
+      maxKeys: 10,
+    });
+
+    const invokeLimiter = async (
+      limiterFn: ReturnType<typeof createBoundedRateLimiter>,
+      ip: string,
+      email?: string
+    ) => {
+      let status = 200;
+      let nextCalled = false;
+      const req = {
+        ip,
+        body: email ? { email } : {},
+        headers: {},
+        socket: { remoteAddress: ip },
+        app: { get: () => false },
+      } as any;
+      const res = {
+        setHeader() {},
+        status(c: number) {
+          status = c;
+          return this;
+        },
+        json() {
+          return this;
+        },
+      } as any;
+      await limiterFn(req, res, () => {
+        nextCalled = true;
+      });
+      return { status, nextCalled };
+    };
+
+    // Target attacker IP `10.99.0.1` hits 3 times (reaching maxRequests = 3, count = 3 > 1)
+    for (let i = 0; i < 3; i++) {
+      const r = await invokeLimiter(antiChurnLimiter, '10.99.0.1');
+      assert.equal(r.status, 200);
+    }
+    // 4th hit is 429
+    assert.equal((await invokeLimiter(antiChurnLimiter, '10.99.0.1')).status, 429);
+
+    // Now flood the limiter with 50 unique single-hit keys (`count === 1`) exceeding `maxKeys: 10`
+    for (let i = 0; i < 50; i++) {
+      await invokeLimiter(antiChurnLimiter, `10.88.0.${i}`);
+    }
+
+    // Verify `10.99.0.1` WAS NOT EVICTED by the single-hit key churn and is STILL blocked (429)!
+    const afterChurn = await invokeLimiter(antiChurnLimiter, '10.99.0.1');
+    assert.equal(
+      afterChurn.status,
+      429,
+      'Active multi-hit rate-limit counter must NOT be evicted by single-hit key churn'
+    );
+
+    // 2. Shared PostgreSQL rate-limit store across two independent limiter instances + secondary per-email rule
+    const pgStore = createPostgresRateLimitStore();
+    const scopeName = `r6-pg-shared-${TEST_RUN_ID}`;
+    const instanceA = createBoundedRateLimiter({
+      scope: scopeName,
+      windowMs: 60_000,
+      maxRequests: 5,
+      maxKeys: 100,
+      store: pgStore,
+      keyGenerator: (req) => `${normalizeClientIp(req)}:${req.body?.email || ''}`,
+      secondaryRules: [
+        {
+          scopeSuffix: 'email',
+          maxRequests: 3,
+          keyGenerator: (req) => req.body?.email || null,
+        },
+      ],
+    });
+    const instanceB = createBoundedRateLimiter({
+      scope: scopeName,
+      windowMs: 60_000,
+      maxRequests: 5,
+      maxKeys: 100,
+      store: pgStore,
+      keyGenerator: (req) => `${normalizeClientIp(req)}:${req.body?.email || ''}`,
+      secondaryRules: [
+        {
+          scopeSuffix: 'email',
+          maxRequests: 3,
+          keyGenerator: (req) => req.body?.email || null,
+        },
+      ],
+    });
+
+    const targetEmail = `victim.${TEST_RUN_ID}@medatlas.test`;
+    // Hit 1 on Instance A from IP 1, Hit 2 on Instance B from IP 2, Hit 3 on Instance A from IP 3
+    assert.equal((await invokeLimiter(instanceA, '10.1.0.1', targetEmail)).status, 200);
+    assert.equal((await invokeLimiter(instanceB, '10.1.0.2', targetEmail)).status, 200);
+    assert.equal((await invokeLimiter(instanceA, '10.1.0.3', targetEmail)).status, 200);
+
+    // Hit 4 on Instance B from a brand-new IP 4 targeting the same email MUST be blocked (429) by the shared email secondary rule!
+    const fourthAcrossInstances = await invokeLimiter(instanceB, '10.1.0.4', targetEmail);
+    assert.equal(
+      fourthAcrossInstances.status,
+      429,
+      'Shared PostgreSQL store and secondary per-email limit must block distributed attacks across instances and IPs'
+    );
+
+    // Clean up test rate limit buckets
+    await db
+      .delete(rateLimitBuckets)
+      .where(
+        inArray(rateLimitBuckets.key, [
+          `${scopeName}:10.1.0.1:${targetEmail}`,
+          `${scopeName}:10.1.0.2:${targetEmail}`,
+          `${scopeName}:10.1.0.3:${targetEmail}`,
+          `${scopeName}:10.1.0.4:${targetEmail}`,
+          `${scopeName}:email:${targetEmail}`,
+        ])
+      );
+
+    // 3. Degraded-mode fallback when backing store throws an error
+    const brokenStore = {
+      consume: async () => {
+        throw new Error('Simulated DB connection outage');
+      },
+      pruneExpired: async () => 0,
+    };
+    const resilientLimiter = createBoundedRateLimiter({
+      scope: `r6-fallback-${TEST_RUN_ID}`,
+      windowMs: 60_000,
+      maxRequests: 2,
+      maxKeys: 20,
+      store: brokenStore,
+    });
+    assert.equal((await invokeLimiter(resilientLimiter, '10.55.0.1')).status, 200);
+    assert.equal((await invokeLimiter(resilientLimiter, '10.55.0.1')).status, 200);
+    assert.equal(
+      (await invokeLimiter(resilientLimiter, '10.55.0.1')).status,
+      429,
+      'In-memory fallback must enforce rate limits when shared store is unreachable'
+    );
+  });
+
+  // ==========================================================================
+  // FINDING 7: DEDICATED SESSION-REVOCATION TIMESTAMP
+  // ==========================================================================
+  it('R7. Uses dedicated sessionsRevokedAt timestamp so profile updates after tokenVersion > 1 never invalidate active sessions', async () => {
+    const email = `r7.sessions.${TEST_RUN_ID}@medatlas.test`;
+    const pass1 = 'R7InitialPass123!';
+    const pass2 = 'R7SecondPass456!';
+
+    const user = await registerEmailPasswordUser(email, pass1, 'R7 Initial Name');
+    createdUserUids.push(user.uid);
+
+    // Increment tokenVersion to 2 via password change
+    const afterPassChange = await changeAuthenticatedUserPassword(user.uid, pass1, pass2);
+    assert.equal(afterPassChange.tokenVersion, 2);
+
+    // Issue a valid session token at tokenVersion = 2
+    const activeTokenV2 = createServerSessionToken({
+      uid: user.uid,
+      email: user.email,
+      name: afterPassChange.displayName,
+      tokenVersion: afterPassChange.tokenVersion,
+    });
+
+    // Wait 20ms then update user profile (displayName and preferences)
+    await new Promise((r) => setTimeout(r, 20));
+    const afterProfileEdit = await updateUserProfile(user.uid, {
+      displayName: 'R7 Updated Display Name',
+      preferences: { theme: 'light', fontSize: 'medium' },
+    });
+    assert.equal(afterProfileEdit.displayName, 'R7 Updated Display Name');
+    assert.equal(afterProfileEdit.tokenVersion, 2);
+
+    // Verify `activeTokenV2` (and a Firebase token issued before the profile edit) STILL SUCCEED!
+    let localStatus = 200;
+    let localNext = false;
+    await requireAuth(
+      { headers: { authorization: `Bearer ${activeTokenV2}` } } as unknown as AuthRequest,
+      {
+        status(c: number) {
+          localStatus = c;
+          return this;
+        },
+        json() {
+          return this;
+        },
+      } as any,
+      () => {
+        localNext = true;
+      }
+    );
+    assert.equal(
+      localNext,
+      true,
+      'Profile updates after tokenVersion > 1 must NOT invalidate active local sessions'
+    );
+    assert.equal(localStatus, 200);
+  });
+
+  // ==========================================================================
+  // FINDING 8: BOUND PASSWORD INPUT AND REDUCE DOS RISK
+  // ==========================================================================
+  it('R8. Enforces strict password character (128) and byte (512) bounds before scrypt, rejects non-string inputs, and supports Unicode passphrases', async () => {
+    assert.equal(MIN_PASSWORD_LENGTH, 8);
+    assert.equal(MAX_PASSWORD_LENGTH, 128);
+    assert.equal(MAX_PASSWORD_BYTES, 512);
+
+    // Non-string rejected
+    assert.equal(validatePasswordBounds(null).valid, false);
+    assert.equal(validatePasswordBounds(12345678).valid, false);
+    assert.equal(validatePasswordBounds({ password: 'abc' }).valid, false);
+
+    // Too short rejected when requireMinLength = true
+    assert.equal(validatePasswordBounds('Short1!', { requireMinLength: true }).valid, false);
+
+    // > 128 characters rejected before scrypt
+    const oversizedChars = 'A'.repeat(129);
+    const charCheck = validatePasswordBounds(oversizedChars);
+    assert.equal(charCheck.valid, false);
+    assert.match(charCheck.error || '', /must not exceed 128 characters/i);
+
+    await assert.rejects(
+      async () => hashPasswordAsync(oversizedChars),
+      /must not exceed 128 characters/i
+    );
+
+    const existingHash = await hashPasswordAsync('ValidNormalPass123!');
+    assert.equal(await verifyPasswordAsync(oversizedChars, existingHash), false);
+
+    // Unicode passphrase within bounds (e.g. medical terminology + accents/symbols) succeeds
+    const unicodePass = 'ClínicaMédica-Histología-2026-αβγ!';
+    assert.equal(validatePasswordBounds(unicodePass).valid, true);
+    const unicodeHash = await hashPasswordAsync(unicodePass);
+    assert.equal(await verifyPasswordAsync(unicodePass, unicodeHash), true);
+  });
+
+  // ==========================================================================
+  // FINDING 9 & 10: ANTI-ENUMERATION & TEST-HOOK PRODUCTION GUARDS
+  // ==========================================================================
+  it('R9 & R10. Blocks test-only override hooks when NODE_ENV is production', () => {
+    const prevEnv = process.env.NODE_ENV;
+    try {
+      process.env.NODE_ENV = 'production';
+      assert.throws(
+        () => setFirebaseTokenVerifierForTests(async () => ({ uid: 'x' } as any)),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () =>
+          setFirebaseOobHandlerForTests({
+            verifyOnly: async () => ({ email: 'a@b.c' }),
+            consume: async () => ({ email: 'a@b.c' }),
+          }),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () => setFirebaseProvisioningHandlerForTests(async () => true),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () => setFirebaseEmailDispatchHandlerForTests(async () => true),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () => setFirebasePasswordUpdateHandlerForTests(async () => true),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () => setFirebasePasswordVerifyHandlerForTests(async () => true),
+        /forbidden outside test environment/i
+      );
+      assert.throws(
+        () => setFirebaseAccountDeletionHandlerForTests(async () => ({ deleted: true })),
+        /forbidden outside test environment/i
+      );
+    } finally {
+      process.env.NODE_ENV = prevEnv;
+    }
+  });
 });
+

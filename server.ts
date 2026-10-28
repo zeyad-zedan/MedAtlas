@@ -5,11 +5,13 @@ import {
   requireAuth,
   type AuthRequest,
   verifyPassword,
+  validatePasswordBounds,
   createServerSessionToken,
   validateAuthConfiguration,
 } from './src/middleware/auth.ts';
 import {
   createBoundedRateLimiter,
+  createPostgresRateLimitStore,
   normalizeClientIp,
   resolveTrustProxyConfig,
 } from './src/middleware/rate-limit.ts';
@@ -72,28 +74,69 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-app.use(express.json({ limit: '5mb' }));
+// Tight default JSON body parser (64kb) for all API and auth endpoints;
+// 5mb parser is scoped exclusively to authenticated admin CSV import endpoints.
+const defaultJsonParser = express.json({ limit: '64kb' });
+const adminCsvImportJsonParser = express.json({ limit: '5mb' });
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (
+    req.path === '/api/admin/import/preview' ||
+    req.path === '/api/admin/import/execute'
+  ) {
+    return adminCsvImportJsonParser(req, res, next);
+  }
+  return defaultJsonParser(req, res, next);
+});
 
-// Bounded, self-pruning rate limiters for authentication and sensitive mutations
+const sharedRateLimitStore = process.env.DATABASE_URL
+  ? createPostgresRateLimitStore()
+  : undefined;
+
+function extractNormalizedRateLimitEmail(req: Request): string | null {
+  const raw = req.body?.email;
+  if (typeof raw !== 'string') return null;
+  const normalized = raw.toLowerCase().trim().slice(0, 120);
+  return normalized.length > 0 ? normalized : null;
+}
+
+// Bounded, shared-store rate limiters with independent per-IP, per-email, and combined limits
 const registerLimiter = createBoundedRateLimiter({
   scope: 'auth-register',
   maxRequests: 15,
   windowMs: 60_000,
   maxKeys: 5_000,
+  store: sharedRateLimitStore,
+  secondaryRules: [
+    {
+      scopeSuffix: 'email',
+      maxRequests: 6,
+      keyGenerator: (req) => extractNormalizedRateLimitEmail(req),
+    },
+  ],
 });
 
 const loginLimiter = createBoundedRateLimiter({
   scope: 'auth-login',
-  maxRequests: 20,
+  maxRequests: 15,
   windowMs: 60_000,
   maxKeys: 5_000,
+  store: sharedRateLimitStore,
   keyGenerator: (req) => {
-    const email =
-      typeof req.body?.email === 'string'
-        ? req.body.email.toLowerCase().trim().slice(0, 80)
-        : '';
+    const email = extractNormalizedRateLimitEmail(req) || '';
     return `${normalizeClientIp(req)}:${email}`;
   },
+  secondaryRules: [
+    {
+      scopeSuffix: 'ip',
+      maxRequests: 25,
+      keyGenerator: (req) => normalizeClientIp(req),
+    },
+    {
+      scopeSuffix: 'email',
+      maxRequests: 12,
+      keyGenerator: (req) => extractNormalizedRateLimitEmail(req),
+    },
+  ],
 });
 
 const forgotPasswordLimiter = createBoundedRateLimiter({
@@ -101,13 +144,23 @@ const forgotPasswordLimiter = createBoundedRateLimiter({
   maxRequests: 6,
   windowMs: 60_000,
   maxKeys: 5_000,
+  store: sharedRateLimitStore,
   keyGenerator: (req) => {
-    const email =
-      typeof req.body?.email === 'string'
-        ? req.body.email.toLowerCase().trim().slice(0, 80)
-        : '';
+    const email = extractNormalizedRateLimitEmail(req) || '';
     return `${normalizeClientIp(req)}:${email}`;
   },
+  secondaryRules: [
+    {
+      scopeSuffix: 'ip',
+      maxRequests: 10,
+      keyGenerator: (req) => normalizeClientIp(req),
+    },
+    {
+      scopeSuffix: 'email',
+      maxRequests: 5,
+      keyGenerator: (req) => extractNormalizedRateLimitEmail(req),
+    },
+  ],
 });
 
 const resetPasswordLimiter = createBoundedRateLimiter({
@@ -115,6 +168,7 @@ const resetPasswordLimiter = createBoundedRateLimiter({
   maxRequests: 10,
   windowMs: 60_000,
   maxKeys: 5_000,
+  store: sharedRateLimitStore,
 });
 
 const passwordMutationLimiter = createBoundedRateLimiter({
@@ -122,6 +176,14 @@ const passwordMutationLimiter = createBoundedRateLimiter({
   maxRequests: 10,
   windowMs: 60_000,
   maxKeys: 5_000,
+  store: sharedRateLimitStore,
+  secondaryRules: [
+    {
+      scopeSuffix: 'uid',
+      maxRequests: 8,
+      keyGenerator: (req) => (req as AuthRequest).user?.uid || null,
+    },
+  ],
 });
 
 function sendErrorResponse(
@@ -194,10 +256,14 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
     if (!email || typeof email !== 'string' || !email.includes('@')) {
       return res.status(400).json({ error: 'Please provide a valid email address.' });
     }
-    if (!password || typeof password !== 'string' || password.length < 8) {
+    if (typeof password !== 'string') {
       return res
         .status(400)
         .json({ error: 'Password must be at least 8 characters long.' });
+    }
+    const bounds = validatePasswordBounds(password, { requireMinLength: true });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: bounds.error });
     }
     if (!displayName || typeof displayName !== 'string' || displayName.trim().length < 2) {
       return res.status(400).json({
@@ -227,11 +293,20 @@ app.post('/api/auth/register', registerLimiter, async (req, res) => {
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
+    if (
+      !email ||
+      typeof email !== 'string' ||
+      !password ||
+      typeof password !== 'string'
+    ) {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
+    const bounds = validatePasswordBounds(password, { requireMinLength: false });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: bounds.error });
+    }
 
-    const user = await authenticateEmailUser(String(email), String(password));
+    const user = await authenticateEmailUser(email, password);
     if (!user) {
       return res.status(401).json({ error: 'Invalid email address or password.' });
     }
@@ -288,7 +363,7 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, async (req, res) =>
 
 /**
  * Step 2 of Password Recovery: Complete password reset using a verified single-use recovery token
- * or a Firebase Authentication password-reset oobCode.
+ * or a Firebase Authentication password-reset oobCode / pasted reset URL.
  * Unauthenticated reset by { email, newPassword } alone is strictly rejected.
  */
 app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
@@ -301,16 +376,20 @@ app.post('/api/auth/reset-password', resetPasswordLimiter, async (req, res) => {
         ? oobCode.trim()
         : '';
 
-    if (!recoverySecret || recoverySecret.length < 20) {
+    if (!recoverySecret || recoverySecret.length < 10) {
       return res.status(400).json({
         error:
           'A valid single-use password recovery token or Firebase reset code is required to reset a password.',
       });
     }
-    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+    if (typeof newPassword !== 'string') {
       return res
         .status(400)
         .json({ error: 'New password must be at least 8 characters long.' });
+    }
+    const bounds = validatePasswordBounds(newPassword, { requireMinLength: true });
+    if (!bounds.valid) {
+      return res.status(400).json({ error: bounds.error });
     }
 
     await confirmPasswordRecoveryToken(recoverySecret, newPassword);
@@ -333,10 +412,27 @@ app.post(
   async (req: AuthRequest, res) => {
     try {
       const { currentPassword, newPassword } = req.body || {};
+      if (typeof currentPassword !== 'string' || typeof newPassword !== 'string') {
+        return res
+          .status(400)
+          .json({ error: 'Current password and new password are required.' });
+      }
+      const currentBounds = validatePasswordBounds(currentPassword, {
+        requireMinLength: false,
+      });
+      if (!currentBounds.valid) {
+        return res.status(400).json({ error: currentBounds.error });
+      }
+      const newBounds = validatePasswordBounds(newPassword, {
+        requireMinLength: true,
+      });
+      if (!newBounds.valid) {
+        return res.status(400).json({ error: newBounds.error });
+      }
       const updated = await changeAuthenticatedUserPassword(
         req.user!.uid,
-        String(currentPassword || ''),
-        String(newPassword || '')
+        currentPassword,
+        newPassword
       );
       const token = createServerSessionToken({
         uid: updated.uid,
@@ -366,9 +462,20 @@ app.post(
   async (req: AuthRequest, res) => {
     try {
       const { newPassword } = req.body || {};
+      if (typeof newPassword !== 'string') {
+        return res
+          .status(400)
+          .json({ error: 'New password must be at least 8 characters long.' });
+      }
+      const newBounds = validatePasswordBounds(newPassword, {
+        requireMinLength: true,
+      });
+      if (!newBounds.valid) {
+        return res.status(400).json({ error: newBounds.error });
+      }
       const updated = await linkPasswordToAuthenticatedAccount(
         req.user!.uid,
-        String(newPassword || '')
+        newPassword
       );
       const token = createServerSessionToken({
         uid: updated.uid,

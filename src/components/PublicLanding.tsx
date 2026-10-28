@@ -44,16 +44,34 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
   const [authError, setAuthError] = useState<string | null>(null);
   const [authSuccess, setAuthSuccess] = useState<string | null>(null);
 
-  // Automatically detect Firebase Auth password-reset oobCode or recovery token in URL query string
+  // Automatically detect Firebase Auth password-reset oobCode, recovery token, or return from hosted action page
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const params = new URLSearchParams(window.location.search);
-    const urlCode =
+    const mode = params.get('mode')?.trim() || '';
+    let urlCode =
       params.get('oobCode')?.trim() ||
       params.get('resetToken')?.trim() ||
       params.get('token')?.trim() ||
       '';
-    if (urlCode.length >= 20) {
+
+    if (!urlCode) {
+      const continueUrlParam = params.get('continueUrl')?.trim();
+      if (continueUrlParam) {
+        try {
+          const innerParams = new URL(continueUrlParam).searchParams;
+          urlCode =
+            innerParams.get('oobCode')?.trim() ||
+            innerParams.get('resetToken')?.trim() ||
+            innerParams.get('token')?.trim() ||
+            '';
+        } catch {
+          // Ignore malformed continueUrl
+        }
+      }
+    }
+
+    if (urlCode.length >= 10) {
       setRecoveryToken(urlCode);
       setAuthTab('reset');
       setResetStep('confirm');
@@ -63,6 +81,16 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
       );
       setAuthModalOpen(true);
       // Strip sensitive recovery code from browser address bar & Referer history
+      const cleanUrl = window.location.pathname + window.location.hash;
+      window.history.replaceState({}, document.title, cleanUrl);
+    } else if (mode === 'resetPassword') {
+      setAuthTab('login');
+      setResetStep('request');
+      setAuthError(null);
+      setAuthSuccess(
+        'If you already updated your password on the verification page, sign in below with your new password to synchronize your MedAtlas account. Otherwise, select the Reset Password tab to paste your reset link.'
+      );
+      setAuthModalOpen(true);
       const cleanUrl = window.location.pathname + window.location.hash;
       window.history.replaceState({}, document.title, cleanUrl);
     }
@@ -97,7 +125,7 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
           setAuthSuccess(res.message);
           setResetStep('confirm');
         } else {
-          const res = await api.confirmPasswordReset(recoveryToken, password);
+          const res = await api.confirmPasswordReset(recoveryToken.trim(), password);
           setAuthSuccess(res.message);
           setRecoveryToken('');
           setPassword('');
@@ -726,16 +754,16 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                     htmlFor="auth-recovery-token"
                     className="block text-xs font-semibold text-slate-700 mb-1"
                   >
-                    Recovery Code / Single-Use Reset Token
+                    Password Reset Link or Single-Use Recovery Code
                   </label>
                   <input
                     id="auth-recovery-token"
                     type="text"
                     required
-                    minLength={20}
+                    minLength={10}
                     value={recoveryToken}
                     onChange={(e) => setRecoveryToken(e.target.value)}
-                    placeholder="Paste your recovery token or reset code"
+                    placeholder="Paste your password reset link or oobCode"
                     className="w-full px-3 py-2 text-sm font-mono-tabular rounded-lg border border-slate-300 focus:outline-none focus:ring-2 focus:ring-[#0284C7]"
                   />
                 </div>
@@ -747,13 +775,14 @@ export const PublicLanding: React.FC<PublicLandingProps> = ({
                     htmlFor="auth-password"
                     className="block text-xs font-semibold text-slate-700 mb-1"
                   >
-                    {authTab === 'reset' ? 'New Password (min 8 characters)' : 'Password'}
+                    {authTab === 'reset' ? 'New Password (8–128 characters)' : 'Password'}
                   </label>
                   <input
                     id="auth-password"
                     type="password"
                     required
                     minLength={8}
+                    maxLength={128}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="••••••••"

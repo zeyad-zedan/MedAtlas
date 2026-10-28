@@ -12,11 +12,15 @@ import {
 export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(),
+  firebaseUid: text('firebase_uid'),
   email: text('email').notNull().unique(),
   displayName: text('display_name').notNull(),
   passwordHash: text('password_hash'),
-  authProvider: text('auth_provider').notNull().default('local'), // 'local' | 'firebase' | 'linked'
+  authProvider: text('auth_provider').notNull().default('local'), // 'local' | 'firebase' | 'both' | 'linked'
   tokenVersion: integer('token_version').notNull().default(1),
+  passwordUpdatedAt: timestamp('password_updated_at'),
+  pendingRecoveryAt: timestamp('pending_recovery_at'),
+  sessionsRevokedAt: timestamp('sessions_revoked_at'),
   accountStatus: text('account_status').notNull().default('active'), // 'active' | 'deleted' | 'suspended'
   deletedAt: timestamp('deleted_at'),
   role: text('role').notNull().default('student'), // 'student' | 'admin'
@@ -41,8 +45,19 @@ export const passwordResetTokens = pgTable('password_reset_tokens', {
 export const deletedAccounts = pgTable('deleted_accounts', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(),
+  firebaseUid: text('firebase_uid'),
   emailHash: text('email_hash').notNull(),
+  remoteCleanupStatus: text('remote_cleanup_status').notNull().default('completed'), // 'completed' | 'pending_retry' | 'not_applicable'
+  lastCleanupError: text('last_cleanup_error'),
   deletedAt: timestamp('deleted_at').defaultNow().notNull(),
+});
+
+export const rateLimitBuckets = pgTable('rate_limit_buckets', {
+  key: text('key').primaryKey(),
+  scope: text('scope').notNull(),
+  count: integer('count').notNull().default(1),
+  resetAt: timestamp('reset_at').notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 
 export const subjects = pgTable('subjects', {

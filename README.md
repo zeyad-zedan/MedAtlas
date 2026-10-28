@@ -57,6 +57,80 @@ Key capabilities and security controls implemented in this release:
 | `TRUST_PROXY_HOPS` | **Optional** | Number of reverse-proxy hops to trust for rate-limiting IP extraction (`1` by default on Cloud Run/production, `0`/`false` when direct). |
 | `PORT` | **Optional** | HTTP server listening port (defaults to `3000`). |
 
+---
+
+## 4. 6-Digit Code Password Recovery & Email Deliverability Guide
+
+### Architecture & Security Guarantees
+MedAtlas MCQ implements an in-app 6-digit verification code password recovery architecture:
+1. **Cryptographically Secure Random Code**:
+   - Generated via `crypto.randomInt(100000, 1000000)` (100000 to 999999).
+2. **Keyed HMAC-SHA256 Hash Storage**:
+   - Plaintext verification codes are **never** stored in the database.
+   - The database stores an HMAC-SHA256 hash keyed with `AUTH_SESSION_SECRET` and salted with the user's permanent unique identifier (`user_uid`). Because 6-digit codes span $10^6$ values, HMAC hashing with a high-entropy secret completely prevents rainbow table precomputation.
+3. **Strict Expiration & Single-Use Consumption**:
+   - Codes expire automatically after **10 minutes**.
+   - Consumption is atomic within a PostgreSQL transaction with `FOR UPDATE` locking.
+4. **Brute-Force & Attempt Caps**:
+   - Each verification code permits a maximum of **5 failed attempts**. Upon the 5th failed attempt, the code is immediately and permanently deactivated (`consumed_at = NOW()`).
+5. **60-Second Resend Cooldown**:
+   - Resending a verification code enforces an account-level 60-second cooldown (`429 Too Many Requests`) calculated against `created_at` of the active token.
+6. **Account Enumeration Protection**:
+   - Requesting a code always returns a uniform generic message whether or not an account exists.
+7. **Session Revocation & Credential Synchronization**:
+   - Resetting a password increments `users.token_version`, updates server revocation timestamps, updates the PostgreSQL `password_hash`, and updates Firebase Authentication for linked accounts.
+
+---
+
+### Transactional Email Provider Setup
+
+To eliminate spam delivery issues, MedAtlas integrates directly with reputable transactional email providers. Configure **one** of the following in your environment variables:
+
+| Variable | Provider | Documentation & Signup |
+| :--- | :--- | :--- |
+| `RESEND_API_KEY` | **Resend** (Recommended) | [resend.com](https://resend.com) |
+| `POSTMARK_SERVER_TOKEN` | **Postmark** | [postmarkapp.com](https://postmarkapp.com) |
+| `SENDGRID_API_KEY` | **SendGrid** | [sendgrid.com](https://sendgrid.com) |
+| `EMAIL_FROM` | **Sender Identity** | Must match your verified sending domain (e.g., `MedAtlas Security <security@medatlas.ai.studio>`) |
+
+If no email provider is configured, the server fails safely with an explicit 503 response explaining that email delivery is unconfigured, rather than falsely pretending the code was delivered.
+
+---
+
+### DNS Configuration Guide for `medatlas.ai.studio` (SPF, DKIM, DMARC)
+
+To achieve 100% inbox deliverability and prevent reset emails from landing in spam filters, configure the following DNS records at your domain registrar / DNS provider for `medatlas.ai.studio`:
+
+#### 1. SPF (Sender Policy Framework)
+Add or update the TXT record for your domain root (`medatlas.ai.studio`):
+```text
+Type:  TXT
+Host:  @ (or medatlas.ai.studio)
+Value: v=spf1 include:resend.com ~all
+```
+*(If using Postmark: `include:spf.mtasv.net ~all`; if SendGrid: `include:sendgrid.net ~all`).*
+
+#### 2. DKIM (DomainKeys Identified Mail)
+In your email provider dashboard (e.g. Resend / Postmark), add your domain `medatlas.ai.studio` and copy the provided CNAME DKIM selector records:
+```text
+Type:  CNAME
+Host:  resend._domainkey.medatlas.ai.studio
+Value: dkim.resend.com
+```
+
+#### 3. DMARC (Domain-based Message Authentication, Reporting, and Conformance)
+Publish a DMARC policy TXT record at the `_dmarc` subdomain:
+```text
+Type:  TXT
+Host:  _dmarc.medatlas.ai.studio
+Value: v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@medatlas.ai.studio; pct=100; adkim=s; aspf=s
+```
+- `p=quarantine`: Instructs mailbox providers (Gmail, Outlook, iCloud) to quarantine messages failing SPF/DKIM instead of dropping legitimate mail.
+- `adkim=s` & `aspf=s`: Enforces strict DKIM and SPF alignment.
+- `pct=100`: Applies to 100% of outbound messages.
+
+---
+
 ### Commands
 1. **Install dependencies**:
    ```bash
@@ -82,5 +156,6 @@ Key capabilities and security controls implemented in this release:
    ```bash
    npm run start
    ```
+
 
 

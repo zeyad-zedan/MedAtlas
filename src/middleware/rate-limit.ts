@@ -1,6 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { sql } from 'drizzle-orm';
-import { db } from '../db/index.ts';
+import { db, isDatabaseConfigured } from '../db/index.ts';
 
 export interface RateLimitEntry {
   count: number;
@@ -241,6 +241,61 @@ export function createPostgresRateLimitStore(): SharedRateLimitStore {
         await db.execute(sql`DELETE FROM rate_limit_buckets`);
       }
     },
+  };
+}
+
+export interface RateLimitStoreResolution {
+  store: SharedRateLimitStore | undefined;
+  type: 'shared_postgres' | 'memory_fallback' | 'memory_local';
+  degradedModePolicy: 'memory_fallback' | 'fail_closed';
+  warning?: string;
+}
+
+/**
+ * Resolves the rate-limit store configuration using the actual configured database connection.
+ * - Detects PostgreSQL availability via `isDatabaseConfigured(env)` (supports SQL_HOST/SQL_USER/... and DATABASE_URL).
+ * - Enforces documented degraded policy: in production, if shared store is unavailable, falls back to memory with a
+ *   deliberate alert and sets degradedModePolicy to fail_closed (or configurable via RATE_LIMIT_DEGRADED_POLICY).
+ * - Never silently claims multi-instance protection when using in-memory storage.
+ */
+export function resolveRateLimitStoreConfig(
+  env: NodeJS.ProcessEnv = process.env
+): RateLimitStoreResolution {
+  const isDbAvailable = isDatabaseConfigured(env);
+  const isProd = env.NODE_ENV === 'production';
+  const degradedModePolicy: 'memory_fallback' | 'fail_closed' =
+    env.RATE_LIMIT_DEGRADED_POLICY === 'fail_closed'
+      ? 'fail_closed'
+      : env.RATE_LIMIT_DEGRADED_POLICY === 'memory_fallback'
+      ? 'memory_fallback'
+      : isProd
+      ? 'fail_closed'
+      : 'memory_fallback';
+
+  if (isDbAvailable) {
+    return {
+      store: createPostgresRateLimitStore(),
+      type: 'shared_postgres',
+      degradedModePolicy,
+    };
+  }
+
+  if (isProd) {
+    const warning =
+      '[SECURITY ALERT] Production environment does not have database credentials configured (SQL_HOST/SQL_USER/SQL_DB_NAME or DATABASE_URL). Multi-instance shared rate limiting cannot be activated. Enforcing documented degraded rate-limiting policy (per-instance in-memory storage).';
+    console.error(warning);
+    return {
+      store: undefined,
+      type: 'memory_fallback',
+      degradedModePolicy,
+      warning,
+    };
+  }
+
+  return {
+    store: undefined,
+    type: 'memory_local',
+    degradedModePolicy: 'memory_fallback',
   };
 }
 

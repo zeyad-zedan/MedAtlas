@@ -26,6 +26,7 @@ import {
 import {
   createBoundedRateLimiter,
   createPostgresRateLimitStore,
+  resolveRateLimitStoreConfig,
   normalizeClientIp,
   resolveTrustProxyConfig,
 } from '../middleware/rate-limit.ts';
@@ -40,12 +41,14 @@ import {
   getOrCreateUser,
   validateTrustedRecoveryOrigin,
   extractRecoveryCodeFromInput,
+  resolveUserFirebaseUid,
   setFirebaseOobHandlerForTests,
   setFirebasePasswordUpdateHandlerForTests,
   setFirebasePasswordVerifyHandlerForTests,
   setFirebaseProvisioningHandlerForTests,
   setFirebaseEmailDispatchHandlerForTests,
   setFirebaseAccountDeletionHandlerForTests,
+  setSimulateDbFailureAfterProviderSyncForTests,
   requestPasswordRecoveryToken,
   confirmPasswordRecoveryToken,
   authenticateEmailUser,
@@ -61,7 +64,7 @@ import {
   completeExamSession,
   type LocalEmailTransportFn,
 } from '../db/repository.ts';
-import { db, pool } from '../db/index.ts';
+import { db, pool, isDatabaseConfigured } from '../db/index.ts';
 import {
   users,
   passwordResetTokens,
@@ -2433,8 +2436,286 @@ describe('Security & Reliability Audit Regression Suite', () => {
         () => setFirebaseAccountDeletionHandlerForTests(async () => ({ deleted: true })),
         /forbidden outside test environment/i
       );
+      assert.throws(
+        () => setSimulateDbFailureAfterProviderSyncForTests(async () => {}),
+        /forbidden outside test environment/i
+      );
     } finally {
       process.env.NODE_ENV = prevEnv;
+    }
+  });
+
+  it('F1. Activates shared PostgreSQL rate-limit store under configured production database credentials, enforces documented degraded policy when credentials missing, and never makes false multi-instance claims', () => {
+    // 1. Configured production database credentials (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) activate shared store
+    const prodConfiguredEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'production',
+      SQL_HOST: '/cloudsql/prod-instance',
+      SQL_USER: 'app_user',
+      SQL_PASSWORD: 'secret_password',
+      SQL_DB_NAME: 'medatlas_db',
+    };
+    assert.equal(isDatabaseConfigured(prodConfiguredEnv), true);
+    const prodResolution = resolveRateLimitStoreConfig(prodConfiguredEnv);
+    assert.equal(prodResolution.type, 'shared_postgres');
+    assert.ok(prodResolution.store !== undefined, 'Shared store must be attached');
+    assert.equal(prodResolution.degradedModePolicy, 'fail_closed');
+
+    // 2. DATABASE_URL also activates shared store
+    const dbUrlEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgres://user:pass@host:5432/db',
+    };
+    assert.equal(isDatabaseConfigured(dbUrlEnv), true);
+    const dbUrlResolution = resolveRateLimitStoreConfig(dbUrlEnv);
+    assert.equal(dbUrlResolution.type, 'shared_postgres');
+    assert.ok(dbUrlResolution.store !== undefined);
+
+    // 3. Unconfigured production environment invokes documented degraded policy (memory_fallback, fail_closed) with explicit alert
+    const prodMissingEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'production',
+    };
+    assert.equal(isDatabaseConfigured(prodMissingEnv), false);
+    const missingResolution = resolveRateLimitStoreConfig(prodMissingEnv);
+    assert.equal(missingResolution.type, 'memory_fallback');
+    assert.equal(missingResolution.store, undefined, 'Must not claim shared multi-instance store when DB unconfigured');
+    assert.equal(missingResolution.degradedModePolicy, 'fail_closed');
+    assert.ok(missingResolution.warning?.includes('SECURITY ALERT'), 'Must log explicit security alert in production');
+
+    // 4. Non-production without DB uses local in-memory store
+    const devMissingEnv: NodeJS.ProcessEnv = {
+      NODE_ENV: 'development',
+    };
+    const devResolution = resolveRateLimitStoreConfig(devMissingEnv);
+    assert.equal(devResolution.type, 'memory_local');
+    assert.equal(devResolution.store, undefined);
+    assert.equal(devResolution.degradedModePolicy, 'memory_fallback');
+  });
+
+  it('F2. Resolves authoritative provider identities without UID prefix guessing across local, Firebase, linked, and arbitrary non-prefix UIDs', async () => {
+    // 1. Pure unit test for resolveUserFirebaseUid across all UID formats
+    // Standard local UID
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'usr_abc123', authProvider: 'local', firebaseUid: null }),
+      null
+    );
+    // Arbitrary non-standard local UID (UUID, custom format, student number - does NOT start with usr_)
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'c7a4b8-uuid-local-999', authProvider: 'local', firebaseUid: null }),
+      null,
+      'Must NOT treat arbitrary local UID as Firebase UID'
+    );
+    // Local account with shadow Firebase identity
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'c7a4b8-uuid-local-999', authProvider: 'local', firebaseUid: 'fb_shadow_456' }),
+      'fb_shadow_456'
+    );
+    // Firebase account with standard Firebase UID
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'fb_standard_uid', authProvider: 'firebase', firebaseUid: null }),
+      'fb_standard_uid'
+    );
+    // Firebase account whose UID happens to start with usr_ (e.g. custom or migrated UID)
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'usr_firebase_custom_id', authProvider: 'firebase', firebaseUid: null }),
+      'usr_firebase_custom_id',
+      'Must recognize Firebase account even if UID begins with usr_'
+    );
+    // Linked account
+    assert.equal(
+      resolveUserFirebaseUid({ uid: 'usr_linked_123', authProvider: 'both', firebaseUid: 'fb_linked_789' }),
+      'fb_linked_789'
+    );
+
+    // 2. Database integration test: Non-standard local UID (uuid-format without usr_ prefix)
+    const suffix = crypto.randomBytes(4).toString('hex');
+    const nonPrefixLocalUid = `uuid_local_${suffix}`;
+    const nonPrefixEmail = `nonprefix.local.${suffix}@test.medatlas.internal`;
+    const initialPassword = 'Password123!Valid';
+    const initialHash = await hashPasswordAsync(initialPassword);
+
+    await db.insert(users).values({
+      uid: nonPrefixLocalUid,
+      email: nonPrefixEmail,
+      displayName: 'Non Prefix Student',
+      passwordHash: initialHash,
+      authProvider: 'local',
+      firebaseUid: null,
+      accountStatus: 'active',
+      role: 'student',
+      tokenVersion: 1,
+    });
+
+    let fbUpdateInvoked = false;
+    setFirebasePasswordUpdateHandlerForTests(async () => {
+      fbUpdateInvoked = true;
+      return true;
+    });
+
+    try {
+      // Password change for non-prefix local account MUST NOT invoke Firebase sync
+      await changeAuthenticatedUserPassword(nonPrefixLocalUid, initialPassword, 'NewPassword123!Valid');
+      assert.equal(fbUpdateInvoked, false, 'Local account without Firebase UID must not invoke Firebase password sync');
+
+      // Account deletion for non-prefix local account MUST report status 'not_applicable', not 'pending_retry'
+      await deleteUserAccount(nonPrefixLocalUid);
+      const [tombstone] = await db
+        .select()
+        .from(deletedAccounts)
+        .where(eq(deletedAccounts.uid, nonPrefixLocalUid));
+      assert.ok(tombstone, 'Tombstone must be recorded');
+      assert.equal(
+        tombstone.remoteCleanupStatus,
+        'not_applicable',
+        'Local account deletion must be not_applicable, not pending_retry'
+      );
+      assert.equal(tombstone.firebaseUid, null);
+    } finally {
+      setFirebasePasswordUpdateHandlerForTests(null);
+      await db.delete(users).where(eq(users.uid, nonPrefixLocalUid)).catch(() => {});
+      await db.delete(deletedAccounts).where(eq(deletedAccounts.uid, nonPrefixLocalUid)).catch(() => {});
+    }
+  });
+
+  it('F3. Password changes are resilient to partial failure: handles provider success followed by DB failure via compensating rollback or defensive invalidation, provider failure, and successful synchronization', async () => {
+    const suffix = crypto.randomBytes(4).toString('hex');
+    const testEmail = `f3.resilience.${suffix}@test.medatlas.internal`;
+    const userUid = `usr_f3_${suffix}`;
+    const fbUid = `fb_f3_${suffix}`;
+    const oldPassword = 'OldPassword123!A';
+    const newPassword = 'NewPassword123!B';
+    const oldHash = await hashPasswordAsync(oldPassword);
+
+    await db.insert(users).values({
+      uid: userUid,
+      firebaseUid: fbUid,
+      email: testEmail,
+      displayName: 'Resilience Test User',
+      passwordHash: oldHash,
+      authProvider: 'both',
+      accountStatus: 'active',
+      role: 'student',
+      tokenVersion: 1,
+      passwordUpdatedAt: new Date(),
+    });
+
+    try {
+      // Case 3.1: Provider failure (Firebase rejects password update)
+      // Must abort cleanly without modifying PostgreSQL
+      setFirebasePasswordUpdateHandlerForTests(async (params) => {
+        if (params.newPassword === newPassword) {
+          return false; // Provider failure
+        }
+        return true;
+      });
+
+      await assert.rejects(
+        async () => changeAuthenticatedUserPassword(userUid, oldPassword, newPassword),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 503
+      );
+
+      // Verify old password still works and new password does not
+      const authOldAfterProviderFail = await authenticateEmailUser(testEmail, oldPassword);
+      assert.ok(authOldAfterProviderFail, 'Old password must still authenticate after provider failure');
+      const authNewAfterProviderFail = await authenticateEmailUser(testEmail, newPassword);
+      assert.equal(authNewAfterProviderFail, null, 'New password must not authenticate after provider failure');
+
+      // Case 3.2: Partial failure: Provider succeeds, then PostgreSQL update fails, with compensating rollback
+      let providerPasswordState = oldPassword;
+      let rollbackInvoked = false;
+
+      setFirebasePasswordUpdateHandlerForTests(async (params) => {
+        if (params.newPassword === newPassword) {
+          providerPasswordState = newPassword; // Provider updated to new password
+          return true;
+        }
+        if (params.newPassword === oldPassword) {
+          providerPasswordState = oldPassword; // Compensating rollback back to old password
+          rollbackInvoked = true;
+          return true;
+        }
+        return true;
+      });
+
+      // Inject DB failure after provider sync
+      setSimulateDbFailureAfterProviderSyncForTests(async () => {
+        throw new Error('Simulated DB connection failure after provider sync');
+      });
+
+      await assert.rejects(
+        async () => changeAuthenticatedUserPassword(userUid, oldPassword, newPassword),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 500
+      );
+
+      assert.equal(rollbackInvoked, true, 'Compensating rollback to Firebase must be invoked on DB failure');
+      assert.equal(providerPasswordState, oldPassword, 'Provider password must be reverted to old password');
+
+      // Case 3.3: Partial failure when compensating rollback cannot be completed:
+      // Must defensively invalidate local password and revoke sessions so old password cannot authenticate
+      setSimulateDbFailureAfterProviderSyncForTests(async () => {
+        throw new Error('Simulated DB failure after provider sync');
+      });
+
+      setFirebasePasswordUpdateHandlerForTests(async (params) => {
+        if (params.newPassword === newPassword) {
+          providerPasswordState = newPassword;
+          return true;
+        }
+        if (params.newPassword === oldPassword) {
+          return false; // Revert failed!
+        }
+        return true;
+      });
+
+      await assert.rejects(
+        async () => changeAuthenticatedUserPassword(userUid, oldPassword, newPassword),
+        (err: any) => err instanceof ClientSafeError && err.statusCode === 500
+      );
+
+      // Verify defensive invalidation: local password was invalidated
+      const [userAfterDefensiveInval] = await db
+        .select()
+        .from(users)
+        .where(eq(users.uid, userUid));
+      assert.equal(
+        userAfterDefensiveInval.passwordHash,
+        null,
+        'Local password hash must be invalidated so old password can NEVER authenticate'
+      );
+      assert.ok(userAfterDefensiveInval.pendingRecoveryAt !== null, 'pendingRecoveryAt must be active for reconciliation');
+
+      // Verify old password cannot authenticate
+      const authOldAfterDefensive = await authenticateEmailUser(testEmail, oldPassword);
+      assert.equal(authOldAfterDefensive, null, 'Old password must NOT authenticate');
+
+      // Now verify new password reconciles through authenticateEmailUser
+      setFirebasePasswordVerifyHandlerForTests(async (email, pwd) => {
+        if (email.toLowerCase().trim() === testEmail.toLowerCase().trim() && pwd === newPassword) {
+          return { valid: true, firebaseUid: fbUid };
+        }
+        return { valid: false, definiteRejection: true };
+      });
+
+      const reconciledUser = await authenticateEmailUser(testEmail, newPassword);
+      assert.ok(reconciledUser, 'New password must reconcile and authenticate successfully');
+
+      // Case 3.4: Successful synchronization (both provider and DB succeed)
+      setSimulateDbFailureAfterProviderSyncForTests(null);
+      const newestPassword = 'NewestPassword123!C';
+      setFirebasePasswordUpdateHandlerForTests(async () => true);
+
+      const changeSuccess = await changeAuthenticatedUserPassword(userUid, newPassword, newestPassword);
+      assert.ok(changeSuccess, 'Password change must succeed when both provider and DB succeed');
+
+      // Old password must fail, newest password must work
+      const authPrev = await authenticateEmailUser(testEmail, newPassword);
+      assert.equal(authPrev, null, 'Previous password must not authenticate after successful change');
+      const authCurrent = await authenticateEmailUser(testEmail, newestPassword);
+      assert.ok(authCurrent, 'Newest password must authenticate after successful change');
+    } finally {
+      setFirebasePasswordUpdateHandlerForTests(null);
+      setFirebasePasswordVerifyHandlerForTests(null);
+      setSimulateDbFailureAfterProviderSyncForTests(null);
+      await db.delete(users).where(eq(users.uid, userUid)).catch(() => {});
     }
   });
 });

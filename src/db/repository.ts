@@ -102,6 +102,34 @@ export function isOwnerAdminEmail(email: string): boolean {
   return email.toLowerCase().trim() === OWNER_ADMIN_EMAIL;
 }
 
+/**
+ * Resolves the explicit Firebase UID for an account strictly from explicit database fields
+ * (`user.firebaseUid` or `user.authProvider === 'firebase' && user.uid`).
+ * NEVER relies on UID prefix guessing (such as `usr_` or `fb_`).
+ */
+export function resolveUserFirebaseUid(user?: {
+  uid: string;
+  firebaseUid?: string | null;
+  authProvider?: string | null;
+} | null): string | null {
+  if (!user) return null;
+  if (
+    user.firebaseUid &&
+    typeof user.firebaseUid === 'string' &&
+    user.firebaseUid.trim().length > 0
+  ) {
+    return user.firebaseUid.trim();
+  }
+  if (
+    user.authProvider === 'firebase' &&
+    typeof user.uid === 'string' &&
+    user.uid.trim().length > 0
+  ) {
+    return user.uid.trim();
+  }
+  return null;
+}
+
 export async function ensureSeededDatabase() {
   // Automatic sample seeding is disabled so deleted subjects, lectures, and quizzes remain permanently deleted.
   return;
@@ -260,11 +288,10 @@ export async function getOrCreateUser(
     }
 
     // Local session tokens must correspond to an already-registered database row;
-    // never auto-create a user from a local token if the row was deleted.
+    // never auto-create a user unless authenticated via an authoritative provider flow (e.g. verified Firebase ID token).
     if (
-      options?.authType === 'local' ||
-      options?.allowCreate === false ||
-      uid.startsWith('usr_')
+      options?.authType !== 'firebase' ||
+      options?.allowCreate === false
     ) {
       throw new ClientSafeError('Unauthorized: Account no longer exists.', 401);
     }
@@ -786,6 +813,17 @@ export function setFirebaseAccountDeletionHandlerForTests(
   customFirebaseAccountDeletionForTests = handler;
 }
 
+let simulateDbFailureAfterProviderSyncForTests:
+  | ((uid: string) => Promise<void>)
+  | null = null;
+
+export function setSimulateDbFailureAfterProviderSyncForTests(
+  handler: ((uid: string) => Promise<void>) | null
+): void {
+  assertTestEnvironmentForOverride('setSimulateDbFailureAfterProviderSyncForTests', handler);
+  simulateDbFailureAfterProviderSyncForTests = handler;
+}
+
 /**
  * Dispatches a password-reset email using the configured Firebase Authentication project
  * (Identity Toolkit accounts:sendOobCode API).
@@ -1038,17 +1076,25 @@ export async function verifyPasswordWithFirebase(
 async function syncPasswordToFirebaseProvider(params: {
   uid: string;
   firebaseUid?: string | null;
+  authProvider?: string | null;
   email: string;
   currentPassword?: string;
   newPassword: string;
   requireSuccess: boolean;
 }): Promise<boolean> {
+  const targetFbUid = resolveUserFirebaseUid({
+    uid: params.uid,
+    firebaseUid: params.firebaseUid,
+    authProvider: params.authProvider,
+  });
+
+  if (!targetFbUid && !params.requireSuccess) {
+    return true;
+  }
+
   if (process.env.NODE_ENV === 'test' && customFirebasePasswordUpdateForTests) {
     return customFirebasePasswordUpdateForTests(params);
   }
-
-  const targetFbUid =
-    params.firebaseUid || (!params.uid.startsWith('usr_') ? params.uid : null);
 
   // 1. Try Firebase Admin SDK if we have a target Firebase UID or can look up by email
   try {
@@ -1877,9 +1923,7 @@ export async function confirmPasswordRecoveryToken(
     });
 
     recordUserSessionRevocation(updatedFirebaseUser.uid, now.getTime());
-    const targetRevokeFbUid =
-      updatedFirebaseUser.firebaseUid ||
-      (!updatedFirebaseUser.uid.startsWith('usr_') ? updatedFirebaseUser.uid : null);
+    const targetRevokeFbUid = resolveUserFirebaseUid(updatedFirebaseUser);
     if (targetRevokeFbUid) {
       recordUserSessionRevocation(targetRevokeFbUid, now.getTime());
       try {
@@ -1947,48 +1991,125 @@ export async function changeAuthenticatedUserPassword(
       throw new ClientSafeError('Current password is incorrect.', 401);
     }
 
-    const hasFirebaseIdentity = Boolean(
-      user.firebaseUid ||
-        user.authProvider === 'firebase' ||
-        user.authProvider === 'both' ||
-        user.authProvider === 'linked' ||
-        !user.uid.startsWith('usr_')
-    );
+    const targetFbUid = resolveUserFirebaseUid(user);
+    const hasFirebaseIdentity = Boolean(targetFbUid);
 
-    const providerSynced = await syncPasswordToFirebaseProvider({
-      uid: user.uid,
-      firebaseUid: user.firebaseUid,
-      email: user.email,
-      currentPassword,
-      newPassword,
-      requireSuccess: hasFirebaseIdentity,
-    });
+    if (hasFirebaseIdentity) {
+      const providerSynced = await syncPasswordToFirebaseProvider({
+        uid: user.uid,
+        firebaseUid: targetFbUid,
+        authProvider: user.authProvider,
+        email: user.email,
+        currentPassword,
+        newPassword,
+        requireSuccess: true,
+      });
 
-    if (!providerSynced) {
-      throw new ClientSafeError(
-        'Unable to synchronize password update with authentication provider. Your password was not changed; please try again shortly.',
-        503
-      );
+      if (!providerSynced) {
+        throw new ClientSafeError(
+          'Unable to synchronize password update with authentication provider. Your password was not changed; please try again shortly.',
+          503
+        );
+      }
     }
 
     const newPasswordHash = await hashPasswordAsync(newPassword);
     const now = new Date();
-    const [updated] = await db
-      .update(users)
-      .set({
-        passwordHash: newPasswordHash,
-        passwordUpdatedAt: now,
-        pendingRecoveryAt: null,
-        sessionsRevokedAt: now,
-        tokenVersion: sql`${users.tokenVersion} + 1`,
-        updatedAt: now,
-      })
-      .where(eq(users.uid, user.uid))
-      .returning();
+
+    let updated: (typeof users.$inferSelect) | undefined;
+    try {
+      if (
+        process.env.NODE_ENV === 'test' &&
+        simulateDbFailureAfterProviderSyncForTests
+      ) {
+        await simulateDbFailureAfterProviderSyncForTests(user.uid);
+      }
+
+      const [res] = await db
+        .update(users)
+        .set({
+          passwordHash: newPasswordHash,
+          passwordUpdatedAt: now,
+          pendingRecoveryAt: null,
+          sessionsRevokedAt: now,
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: now,
+        })
+        .where(eq(users.uid, user.uid))
+        .returning();
+
+      updated = res;
+    } catch (dbError: any) {
+      console.error('Database update failed after Firebase password sync:', dbError);
+
+      if (hasFirebaseIdentity) {
+        // Safe compensating action: attempt to revert Firebase back to currentPassword
+        let compensated = false;
+        try {
+          compensated = await syncPasswordToFirebaseProvider({
+            uid: user.uid,
+            firebaseUid: targetFbUid,
+            authProvider: user.authProvider,
+            email: user.email,
+            currentPassword: newPassword, // Firebase is currently at newPassword
+            newPassword: currentPassword, // Revert back to currentPassword
+            requireSuccess: false,
+          });
+        } catch (compErr) {
+          console.error('Firebase compensating rollback threw:', compErr);
+        }
+
+        if (compensated) {
+          // Both Firebase and PostgreSQL are confirmed back at currentPassword.
+          throw new ClientSafeError(
+            'Database error prevented updating password. Provider update was safely reverted; your existing password remains active.',
+            500
+          );
+        }
+
+        // Compensating rollback on Firebase could not be completed or confirmed.
+        // Firebase now holds newPassword while PostgreSQL holds the old password.
+        // CRITICAL DEFENSIVE GUARD: Ensure the old local password cannot authenticate.
+        // Set pendingRecoveryAt and invalidate local passwordHash so old password is never accepted.
+        try {
+          await db
+            .update(users)
+            .set({
+              passwordHash: null,
+              pendingRecoveryAt: now,
+              sessionsRevokedAt: now,
+              tokenVersion: sql`${users.tokenVersion} + 1`,
+              updatedAt: now,
+            })
+            .where(eq(users.uid, user.uid));
+        } catch (invalErr) {
+          console.error('Failed to invalidate local password hash on DB failure:', invalErr);
+        }
+
+        recordUserSessionRevocation(user.uid, now.getTime());
+        if (targetFbUid) {
+          recordUserSessionRevocation(targetFbUid, now.getTime());
+        }
+
+        throw new ClientSafeError(
+          'Database error occurred during password update. For your security, existing sessions and local credentials have been invalidated. Please sign in with your new password or reset your password.',
+          500
+        );
+      }
+
+      throw new ClientSafeError(
+        'Database error prevented updating password. Please try again.',
+        500
+      );
+    }
+
+    if (!updated) {
+      throw new ClientSafeError('Account not found.', 404);
+    }
 
     recordUserSessionRevocation(user.uid, now.getTime());
-    if (user.firebaseUid) {
-      recordUserSessionRevocation(user.firebaseUid, now.getTime());
+    if (targetFbUid) {
+      recordUserSessionRevocation(targetFbUid, now.getTime());
     }
     return updated;
   } catch (error) {
@@ -2030,10 +2151,12 @@ export async function linkPasswordToAuthenticatedAccount(
       );
     }
 
+    const targetFbUid = resolveUserFirebaseUid(user);
     // Best-effort sync to Firebase Auth if Admin SDK is available; if a custom test handler is active, honor it
     const synced = await syncPasswordToFirebaseProvider({
       uid: user.uid,
-      firebaseUid: user.firebaseUid || (!user.uid.startsWith('usr_') ? user.uid : null),
+      firebaseUid: targetFbUid,
+      authProvider: user.authProvider,
       email: user.email,
       newPassword,
       requireSuccess: Boolean(
@@ -2053,7 +2176,7 @@ export async function linkPasswordToAuthenticatedAccount(
       .update(users)
       .set({
         passwordHash: newPasswordHash,
-        firebaseUid: user.firebaseUid || (!user.uid.startsWith('usr_') ? user.uid : null),
+        firebaseUid: targetFbUid,
         authProvider: 'both',
         passwordUpdatedAt: now,
         pendingRecoveryAt: null,
@@ -2089,7 +2212,7 @@ export async function revokeUserSessions(uid: string) {
     .where(or(eq(users.uid, uid), eq(users.firebaseUid, uid)));
   const user = rows[0];
   const primaryUid = user?.uid || uid;
-  const fbUid = user?.firebaseUid || (!primaryUid.startsWith('usr_') ? primaryUid : null);
+  const fbUid = resolveUserFirebaseUid(user);
 
   await db
     .update(users)
@@ -2154,14 +2277,18 @@ export async function updateUserProfile(
 async function cleanupFirebaseIdentityOnDeletion(params: {
   uid: string;
   firebaseUid?: string | null;
+  authProvider?: string | null;
   email?: string;
 }): Promise<{
   status: 'completed' | 'pending_retry' | 'not_applicable';
   resolvedFirebaseUid?: string | null;
   errorCode?: string;
 }> {
-  const candidateFbUid =
-    params.firebaseUid || (!params.uid.startsWith('usr_') ? params.uid : null);
+  const candidateFbUid = resolveUserFirebaseUid({
+    uid: params.uid,
+    firebaseUid: params.firebaseUid,
+    authProvider: params.authProvider,
+  });
 
   if (process.env.NODE_ENV === 'test' && customFirebaseAccountDeletionForTests) {
     const testRes = await customFirebaseAccountDeletionForTests({
@@ -2177,7 +2304,7 @@ async function cleanupFirebaseIdentityOnDeletion(params: {
   }
 
   let resolvedFbUid = candidateFbUid;
-  if (!resolvedFbUid && params.email) {
+  if (!resolvedFbUid && params.email && params.authProvider !== 'local') {
     try {
       const found = await adminAuth.getUserByEmail(params.email.toLowerCase().trim());
       if (found?.uid) {
@@ -2191,8 +2318,9 @@ async function cleanupFirebaseIdentityOnDeletion(params: {
   }
 
   if (!resolvedFbUid) {
+    const isPureLocal = params.authProvider === 'local' && !params.firebaseUid;
     return {
-      status: params.uid.startsWith('usr_') ? 'not_applicable' : 'pending_retry',
+      status: isPureLocal ? 'not_applicable' : 'pending_retry',
       resolvedFirebaseUid: null,
     };
   }
@@ -2288,12 +2416,12 @@ export async function deleteUserAccount(uid: string) {
       .where(or(eq(users.uid, uid), eq(users.firebaseUid, uid)));
     const user = existingRows[0];
     const primaryUid = user?.uid || uid;
-    const initialFbUid =
-      user?.firebaseUid || (!primaryUid.startsWith('usr_') ? primaryUid : null);
+    const initialFbUid = resolveUserFirebaseUid(user);
 
     const remoteCleanup = await cleanupFirebaseIdentityOnDeletion({
       uid: primaryUid,
       firebaseUid: initialFbUid,
+      authProvider: user?.authProvider,
       email: user?.email,
     });
     const resolvedFbUid = remoteCleanup.resolvedFirebaseUid || initialFbUid;
@@ -4197,11 +4325,7 @@ export async function updateUserRoleAdmin(
       if (targetUser.firebaseUid) {
         recordUserSessionRevocation(targetUser.firebaseUid);
       }
-      const targetFirebaseUid =
-        targetUser.firebaseUid ||
-        (targetUser.authProvider !== 'local' && !targetUser.uid.startsWith('usr_')
-          ? targetUser.uid
-          : null);
+      const targetFirebaseUid = resolveUserFirebaseUid(targetUser);
       if (targetFirebaseUid) {
         try {
           await adminAuth.revokeRefreshTokens(targetFirebaseUid);

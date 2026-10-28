@@ -12,6 +12,7 @@ import {
 import {
   createBoundedRateLimiter,
   createPostgresRateLimitStore,
+  resolveRateLimitStoreConfig,
   normalizeClientIp,
   resolveTrustProxyConfig,
 } from './src/middleware/rate-limit.ts';
@@ -88,9 +89,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   return defaultJsonParser(req, res, next);
 });
 
-const sharedRateLimitStore = process.env.DATABASE_URL
-  ? createPostgresRateLimitStore()
-  : undefined;
+const rateLimitResolution = resolveRateLimitStoreConfig(process.env);
+const sharedRateLimitStore = rateLimitResolution.store;
+const rateLimitDegradedPolicy = rateLimitResolution.degradedModePolicy;
 
 function extractNormalizedRateLimitEmail(req: Request): string | null {
   const raw = req.body?.email;
@@ -106,6 +107,7 @@ const registerLimiter = createBoundedRateLimiter({
   windowMs: 60_000,
   maxKeys: 5_000,
   store: sharedRateLimitStore,
+  degradedModePolicy: rateLimitDegradedPolicy,
   secondaryRules: [
     {
       scopeSuffix: 'email',
@@ -121,6 +123,7 @@ const loginLimiter = createBoundedRateLimiter({
   windowMs: 60_000,
   maxKeys: 5_000,
   store: sharedRateLimitStore,
+  degradedModePolicy: rateLimitDegradedPolicy,
   keyGenerator: (req) => {
     const email = extractNormalizedRateLimitEmail(req) || '';
     return `${normalizeClientIp(req)}:${email}`;
@@ -145,6 +148,7 @@ const forgotPasswordLimiter = createBoundedRateLimiter({
   windowMs: 60_000,
   maxKeys: 5_000,
   store: sharedRateLimitStore,
+  degradedModePolicy: rateLimitDegradedPolicy,
   keyGenerator: (req) => {
     const email = extractNormalizedRateLimitEmail(req) || '';
     return `${normalizeClientIp(req)}:${email}`;
@@ -169,6 +173,7 @@ const resetPasswordLimiter = createBoundedRateLimiter({
   windowMs: 60_000,
   maxKeys: 5_000,
   store: sharedRateLimitStore,
+  degradedModePolicy: rateLimitDegradedPolicy,
 });
 
 const passwordMutationLimiter = createBoundedRateLimiter({
@@ -177,6 +182,7 @@ const passwordMutationLimiter = createBoundedRateLimiter({
   windowMs: 60_000,
   maxKeys: 5_000,
   store: sharedRateLimitStore,
+  degradedModePolicy: rateLimitDegradedPolicy,
   secondaryRules: [
     {
       scopeSuffix: 'uid',
